@@ -2,9 +2,6 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 
-# ==========================================
-# 模組一：打卡紀錄清洗
-# ==========================================
 def clean_ichef_data(file):
     cleaned_data = []
     error_log = []
@@ -15,7 +12,7 @@ def clean_ichef_data(file):
     for index, row in raw_data.iterrows():
         action = str(row[0]).strip()
         time_record = str(row[1]).strip()
-        system_keywords = ["上班", "下班", "無下班", "無上班", "無下班記錄", "無上班記錄", "無下班紀錄", "無上班紀錄", "結帳收銀", "admin", "nan"]
+        system_keywords = ["上班", "下班", "無下班", "無上班", "無下班記錄", "無上班記錄", "無下班紀錄", "無上班紀錄", "結帳收銀", "admin", "nan", "總時數：0:00:00"]
 
         is_employee = True
         if action in system_keywords or "總時數" in action:
@@ -50,18 +47,15 @@ def clean_ichef_data(file):
                 error_log.append({"員工": current_employee, "異常類型": "有下班無上班", "打卡時間": time_record})
 
         elif "無下班" in action:
-            error_log.append({"員工": current_employee, "異常類型": "iCHEF標記無下班", "打卡時間": current_clock_in if current_clock_in else time_record})
+            error_log.append({"員工": current_employee, "異常類型": "系統標記無下班", "打卡時間": current_clock_in if current_clock_in else time_record})
             current_clock_in = None
             
         elif "無上班" in action:
-            error_log.append({"員工": current_employee, "異常類型": "iCHEF標記無上班", "打卡時間": time_record})
+            error_log.append({"員工": current_employee, "異常類型": "系統標記無上班", "打卡時間": time_record})
             current_clock_in = None
 
     return pd.DataFrame(cleaned_data), pd.DataFrame(error_log)
 
-# ==========================================
-# 模組二：強固型班表攤平
-# ==========================================
 def parse_roster_data(file, target_sheet):
     raw_roster = pd.read_excel(file, sheet_name=target_sheet, header=None)
     roster_list = []
@@ -128,9 +122,6 @@ def parse_roster_data(file, target_sheet):
                     
     return pd.DataFrame(roster_list), ""
 
-# ==========================================
-# 模組三：全新標準化異常表解析引擎
-# ==========================================
 def parse_standard_anomaly_data(file):
     if file is None:
         return pd.DataFrame()
@@ -144,17 +135,19 @@ def parse_standard_anomaly_data(file):
         anomalies = []
         for index, row in df.iterrows():
             date_val = str(row.iloc[0]).strip()
-            # 防禦機制：只抓取真正的日期資料列
-            if date_val.startswith("202") and len(row) >= 5:
-                # 統一格式轉換
-                date_str = date_val[:10].replace("/", "-") 
+            if "202" in date_val and len(row) >= 5:
+                try:
+                    dt = pd.to_datetime(date_val)
+                    date_str = dt.strftime('%Y-%m-%d')
+                except:
+                    continue
+                    
                 name = str(row.iloc[1]).strip()
                 command = str(row.iloc[2]).strip()
                 time_val = str(row.iloc[3]).strip()
                 hours_val = str(row.iloc[4]).strip()
                 reason = str(row.iloc[5]).strip() if len(row) > 5 else ""
                 
-                # 安全的數值轉換
                 try:
                     hours_float = float(hours_val)
                 except:
@@ -172,9 +165,6 @@ def parse_standard_anomaly_data(file):
     except Exception as e:
         return pd.DataFrame()
 
-# ==========================================
-# 核心引擎：工時碰撞、指令動態覆寫結算
-# ==========================================
 def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     results = []
     audit_logs = []
@@ -192,7 +182,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         
         emp_punches = df_actual[(df_actual['員工'] == emp) & (df_actual['日期'] == date)]
         
-        # --- 啟動異常表最高權限覆寫 ---
         shift_str = original_shift_str
         manual_add_ot = 0.0
         missing_punch_dts = []
@@ -211,13 +200,13 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     has_override = True
                     override_reasons.append(f"調休變更: {reason}")
                     
-                elif cmd == "變更為上班":
+                elif cmd == "變更為應勤":
                     shift_str = "正常班"
                     is_working = True
                     has_override = True
                     override_reasons.append(f"調休變更: {reason}")
                     
-                elif cmd in ["補登上班", "補登下班"]:
+                elif cmd in ["補登上班", "補登下班", "上班補登", "下班補登"]:
                     if pd.notna(anom['時間']):
                         ts = str(anom['時間']).strip()
                         if len(ts) == 5:
@@ -236,7 +225,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                         has_override = True
                         override_reasons.append(f"時數增減 {anom['時數']}H: {reason}")
 
-        # 彙整所有打卡紀錄
         all_times = []
         for _, punch in emp_punches.iterrows():
             if pd.notna(punch['上班時間']):
@@ -246,12 +234,9 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         all_times.extend(missing_punch_dts)
         all_times.sort()
         
-        # --- 系統防禦：排休無打卡 ---
         if not is_working and not all_times:
-            # 正常休假，完全靜默不計算
             continue
             
-        # --- 系統防禦：排班但無打卡 ---
         if is_working and not all_times:
             results.append({
                 "日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, 
@@ -261,24 +246,16 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
 
         actual_in = all_times[0]
         actual_out = all_times[-1]
-        
-        # --- 偶數配對演算法 (排除空班) ---
-        total_actual_hours = 0
         span_hours = (actual_out - actual_in).total_seconds() / 3600.0
-        
-        if len(all_times) % 2 == 0:
-            for i in range(0, len(all_times), 2):
-                total_actual_hours += (all_times[i+1] - all_times[i]).total_seconds() / 3600.0
-        else:
-            # 極端防禦：若打卡數為奇數，套用最保守扣除
-            if span_hours > 8.5 and is_working and shift_str == "正常班":
-                total_actual_hours = span_hours - 2.5
+
+        if not is_working and all_times:
+            total_actual_hours = 0
+            if len(all_times) % 2 == 0:
+                for i in range(0, len(all_times), 2):
+                    total_actual_hours += (all_times[i+1] - all_times[i]).total_seconds() / 3600.0
             else:
                 total_actual_hours = span_hours
                 
-        # --- 休假日支援判定引擎 ---
-        if not is_working and all_times:
-            # 排休卻有打卡，視為支援救火，時數全額轉為加班
             if emp_type == "PT":
                 support_ot = ((total_actual_hours * 60.0) // 30) * 0.5
             else:
@@ -289,14 +266,16 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                 "日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, 
                 "遲到(分)": 0, "早退(分)": 0, "加班(時)": support_ot, "總工時(時)": round(total_actual_hours, 2), "狀態": "休假支援(全額加班)"
             })
-            if has_override:
-                audit_logs.append({
-                    "日期": date, "員工": emp, "原始判定": "休假支援", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)
-                })
             continue
 
-        # --- PT 正常計算邏輯 ---
         if emp_type == "PT":
+            total_actual_hours = 0
+            if len(all_times) % 2 == 0:
+                for i in range(0, len(all_times), 2):
+                    total_actual_hours += (all_times[i+1] - all_times[i]).total_seconds() / 3600.0
+            else:
+                total_actual_hours = span_hours
+                
             pt_hours = ((total_actual_hours * 60.0) // 30) * 0.5
             pt_hours += manual_add_ot
             
@@ -305,22 +284,70 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                 "日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, 
                 "遲到(分)": 0, "早退(分)": 0, "加班(時)": manual_add_ot, "總工時(時)": pt_hours, "狀態": final_status
             })
-            if has_override:
-                audit_logs.append({
-                    "日期": date, "員工": emp, "原始判定": "PT工時結算", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)
-                })
             continue
             
-        # --- 正職正常計算邏輯 ---
+        late_mins = 0
+        early_leave_mins = 0
+        total_calculated_hours = 0
+        
         if shift_str == "正常班":
-            if actual_in.hour < 13:
-                sched_in = pd.to_datetime(f"{date} 11:00:00")
-                sched_out = pd.to_datetime(f"{date} 23:00:00")
-                is_full_day = True
+            if actual_in.hour < 13 or len(all_times) >= 4:
+                sched1_in = pd.to_datetime(f"{date} 11:00:00")
+                sched1_out = pd.to_datetime(f"{date} 14:30:00")
+                sched2_in = pd.to_datetime(f"{date} 17:00:00")
+                sched2_out = pd.to_datetime(f"{date} 23:00:00")
+                
+                if all_times[0] > sched1_in:
+                    late_mins += int((all_times[0] - sched1_in).total_seconds() / 60)
+                if len(all_times) >= 4 and all_times[2] > sched2_in:
+                    late_mins += int((all_times[2] - sched2_in).total_seconds() / 60)
+                
+                s1_in = max(all_times[0], sched1_in)
+                s1_out = min(all_times[1] if len(all_times) >= 2 else all_times[0], sched1_out)
+                h1 = max(0, (s1_out - s1_in).total_seconds() / 3600.0)
+                
+                if len(all_times) >= 4:
+                    s2_in = max(all_times[2], sched2_in)
+                    s2_act_out = all_times[3]
+                elif len(all_times) == 2:
+                    s2_in = sched2_in
+                    s2_act_out = all_times[1]
+                else:
+                    s2_in = sched2_in
+                    s2_act_out = all_times[-1]
+                
+                if s2_act_out < sched2_out and (sched2_out - s2_act_out).total_seconds() <= 1800:
+                    s2_out = sched2_out
+                else:
+                    s2_out = min(s2_act_out, sched2_out)
+                    diff = int((sched2_out - s2_act_out).total_seconds() / 60)
+                    if diff > 30:
+                        early_leave_mins = diff
+                        
+                h2 = max(0, (s2_out - s2_in).total_seconds() / 3600.0)
+                total_calculated_hours = h1 + h2
+                base_hours = 8.5
             else:
                 sched_in = pd.to_datetime(f"{date} 15:00:00")
                 sched_out = pd.to_datetime(f"{date} 23:00:00")
-                is_full_day = False
+                
+                if all_times[0] > sched_in:
+                    late_mins += int((all_times[0] - sched_in).total_seconds() / 60)
+                    
+                if actual_out < sched_out:
+                    diff = int((sched_out - actual_out).total_seconds() / 60)
+                    if diff > 30:
+                        early_leave_mins = diff
+                        valid_out = actual_out
+                    else:
+                        valid_out = sched_out
+                else:
+                    valid_out = min(actual_out, sched_out)
+                    
+                valid_in = max(all_times[0], sched_in)
+                total_calculated_hours = max(0, (valid_out - valid_in).total_seconds() / 3600.0)
+                base_hours = 8.0
+                
         else:
             try:
                 start_str, end_str = shift_str.split('-')
@@ -330,44 +357,48 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                 sched_out = pd.to_datetime(f"{date} {end_str}")
                 if sched_out < sched_in:
                     sched_out += timedelta(days=1)
-                is_full_day = (sched_out - sched_in).total_seconds() >= 36000 
+                    
+                if all_times[0] > sched_in:
+                    late_mins += int((all_times[0] - sched_in).total_seconds() / 60)
+                    
+                if actual_out < sched_out:
+                    diff = int((sched_out - actual_out).total_seconds() / 60)
+                    if diff > 30:
+                        early_leave_mins = diff
+                        valid_out = actual_out
+                    else:
+                        valid_out = sched_out
+                else:
+                    valid_out = min(actual_out, sched_out)
+                    
+                total_calculated_hours = 0
+                if len(all_times) % 2 == 0:
+                    for i in range(0, len(all_times), 2):
+                        in_time = all_times[i]
+                        out_time = all_times[i+1]
+                        if i == 0: in_time = max(in_time, sched_in)
+                        if i == len(all_times)-2: out_time = valid_out
+                        total_calculated_hours += max(0, (out_time - in_time).total_seconds() / 3600.0)
+                else:
+                    in_time = max(all_times[0], sched_in)
+                    total_calculated_hours = max(0, (valid_out - in_time).total_seconds() / 3600.0)
+                    
+                base_hours = (sched_out - sched_in).total_seconds() / 3600.0
             except:
-                sched_in = actual_in 
-                sched_out = actual_out
-                is_full_day = False
+                base_hours = 8.5
                 
-        late_mins = 0
-        if actual_in > sched_in:
-            late_mins = int((actual_in - sched_in).total_seconds() / 60)
-            
-        early_leave_mins = 0
-        welfare_virtual_hours = 0
-        if actual_out < sched_out:
-            diff_mins = int((sched_out - actual_out).total_seconds() / 60)
-            if diff_mins <= 30:
-                early_leave_mins = 0
-                welfare_virtual_hours = diff_mins / 60.0
-            else:
-                early_leave_mins = diff_mins
-                
-        final_calculated_hours = total_actual_hours + welfare_virtual_hours
-        
-        overtime_hours = 0
-        if is_full_day:
-            overflow = final_calculated_hours - 8.5
-        else:
-            sched_total = (sched_out - sched_in).total_seconds() / 3600.0
-            overflow = final_calculated_hours - sched_total
-            
+        overflow = total_calculated_hours - base_hours
         if overflow > 0:
             overtime_hours = (overflow // 0.5) * 0.5
+        else:
+            overtime_hours = 0
             
         overtime_hours += manual_add_ot
         final_status = "已套用異常覆寫" if has_override else "正常結算"
             
         results.append({
             "日期": date, "員工": emp, "身份": "正職", "班別": shift_str, 
-            "遲到(分)": late_mins, "早退(分)": early_leave_mins, "加班(時)": overtime_hours, "總工時(時)": round(final_calculated_hours, 2), "狀態": final_status
+            "遲到(分)": late_mins, "早退(分)": early_leave_mins, "加班(時)": overtime_hours, "總工時(時)": round(total_calculated_hours, 2), "狀態": final_status
         })
         
         if has_override:
@@ -377,9 +408,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
 
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
-# ==========================================
-# 介面渲染
-# ==========================================
 st.set_page_config(page_title="IKKON 薪資結算系統", layout="wide")
 st.title("IKKON 薪資自動化結算系統")
 
