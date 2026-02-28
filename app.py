@@ -14,16 +14,13 @@ def clean_ichef_data(file):
         action = str(row[0]).strip()
         time_record = str(row[1]).strip()
         
-        # 定義 iCHEF 系統產生的所有「非員工姓名」關鍵字，建立絕對防禦網
         system_keywords = ["上班", "下班", "無下班", "無上班", "無下班記錄", "無上班記錄", "無下班紀錄", "無上班紀錄", "結帳收銀", "admin", "nan"]
 
-        # 邏輯區塊一：精準辨識員工姓名
         is_employee = True
         if action in system_keywords or "總時數" in action:
             is_employee = False
             
         if is_employee and action != "":
-            # 【防禦機制加強】換人前，檢查上一個人是不是有忘記下班的紀錄卡在暫存區
             if current_clock_in is not None:
                 error_log.append({
                     "員工": current_employee,
@@ -33,17 +30,37 @@ def clean_ichef_data(file):
             current_employee = action
             current_clock_in = None
 
-        # 邏輯區塊二：處理「上班」
         elif action == "上班":
             if current_clock_in is not None:
-                error_log.append({
-                    "員工": current_employee,
-                    "異常類型": "連續兩次上班打卡，無下班紀錄",
-                    "打卡時間": current_clock_in
-                })
-            current_clock_in = time_record
+                # 啟動防禦與容錯機制：計算兩次打卡的時間差
+                try:
+                    t1 = pd.to_datetime(current_clock_in)
+                    t2 = pd.to_datetime(time_record)
+                    diff_minutes = abs((t2 - t1).total_seconds()) / 60.0
+                    
+                    if diff_minutes <= 10:
+                        # 10分鐘內容錯：靜默處理，保留最早的 current_clock_in，不寫入異常清單
+                        pass 
+                    else:
+                        # 超過10分鐘：觸發異常攔截
+                        error_log.append({
+                            "員工": current_employee,
+                            "異常類型": f"連續兩次上班打卡 (間隔 {int(diff_minutes)} 分鐘)",
+                            "打卡時間": current_clock_in
+                        })
+                        # 將最新的打卡時間覆蓋暫存，等待後續下班配對
+                        current_clock_in = time_record
+                except Exception:
+                    # 若遇極端時間格式錯誤，退回絕對防禦
+                    error_log.append({
+                        "員工": current_employee,
+                        "異常類型": "連續兩次上班打卡 (時間無法解析)",
+                        "打卡時間": current_clock_in
+                    })
+                    current_clock_in = time_record
+            else:
+                current_clock_in = time_record
 
-        # 邏輯區塊三：處理「下班」
         elif action == "下班":
             if current_clock_in is not None:
                 cleaned_data.append({
@@ -59,7 +76,6 @@ def clean_ichef_data(file):
                     "打卡時間": time_record
                 })
 
-        # 邏輯區塊四：處理 iCHEF 標記的各種無上下班異常
         elif "無下班" in action:
             error_log.append({
                 "員工": current_employee,
