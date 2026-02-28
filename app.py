@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 
+# ==========================================
+# 模組一：打卡紀錄清洗 (保留孤兒紀錄防禦升級)
+# ==========================================
 def clean_ichef_data(file):
     cleaned_data = []
     error_log = []
@@ -21,6 +24,8 @@ def clean_ichef_data(file):
         if is_employee and action != "":
             if current_clock_in is not None:
                 error_log.append({"員工": current_employee, "異常類型": "換人前無下班紀錄", "打卡時間": current_clock_in})
+                # 防禦升級：保留只有上班的孤兒紀錄，供模組三縫合
+                cleaned_data.append({"員工": current_employee, "上班時間": current_clock_in, "下班時間": pd.NaT})
             current_employee = action
             current_clock_in = None
 
@@ -33,8 +38,10 @@ def clean_ichef_data(file):
                         pass 
                     else:
                         error_log.append({"員工": current_employee, "異常類型": "連續上班打卡", "打卡時間": current_clock_in})
+                        cleaned_data.append({"員工": current_employee, "上班時間": current_clock_in, "下班時間": pd.NaT})
                         current_clock_in = time_record
                 except:
+                    cleaned_data.append({"員工": current_employee, "上班時間": current_clock_in, "下班時間": pd.NaT})
                     current_clock_in = time_record
             else:
                 current_clock_in = time_record
@@ -45,17 +52,29 @@ def clean_ichef_data(file):
                 current_clock_in = None
             else:
                 error_log.append({"員工": current_employee, "異常類型": "有下班無上班", "打卡時間": time_record})
+                # 防禦升級：保留只有下班的孤兒紀錄，供模組三縫合
+                cleaned_data.append({"員工": current_employee, "上班時間": pd.NaT, "下班時間": time_record})
 
         elif "無下班" in action:
             error_log.append({"員工": current_employee, "異常類型": "系統標記無下班", "打卡時間": current_clock_in if current_clock_in else time_record})
+            if current_clock_in is not None:
+                cleaned_data.append({"員工": current_employee, "上班時間": current_clock_in, "下班時間": pd.NaT})
             current_clock_in = None
             
         elif "無上班" in action:
             error_log.append({"員工": current_employee, "異常類型": "系統標記無上班", "打卡時間": time_record})
+            cleaned_data.append({"員工": current_employee, "上班時間": pd.NaT, "下班時間": time_record})
             current_clock_in = None
+
+    if current_clock_in is not None:
+        error_log.append({"員工": current_employee, "異常類型": "最後一筆無下班", "打卡時間": current_clock_in})
+        cleaned_data.append({"員工": current_employee, "上班時間": current_clock_in, "下班時間": pd.NaT})
 
     return pd.DataFrame(cleaned_data), pd.DataFrame(error_log)
 
+# ==========================================
+# 模組二：強固型班表攤平
+# ==========================================
 def parse_roster_data(file, target_sheet):
     raw_roster = pd.read_excel(file, sheet_name=target_sheet, header=None)
     roster_list = []
@@ -122,6 +141,9 @@ def parse_roster_data(file, target_sheet):
                     
     return pd.DataFrame(roster_list), ""
 
+# ==========================================
+# 模組三：標準化異常表解析引擎
+# ==========================================
 def parse_standard_anomaly_data(file):
     if file is None:
         return pd.DataFrame()
@@ -165,13 +187,18 @@ def parse_standard_anomaly_data(file):
     except Exception as e:
         return pd.DataFrame()
 
+# ==========================================
+# 核心引擎：工時碰撞、指令動態覆寫結算
+# ==========================================
 def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     results = []
     audit_logs = []
     
+    # 確保即使只有單邊打卡的紀錄，也能被精準轉換日期
     df_actual['上班時間'] = pd.to_datetime(df_actual['上班時間'])
     df_actual['下班時間'] = pd.to_datetime(df_actual['下班時間'])
-    df_actual['日期'] = df_actual['上班時間'].dt.strftime('%Y-%m-%d')
+    df_actual['temp_time'] = df_actual['上班時間'].fillna(df_actual['下班時間'])
+    df_actual['日期'] = df_actual['temp_time'].dt.strftime('%Y-%m-%d')
     
     for _, scheduled in df_roster.iterrows():
         date = scheduled['日期']
@@ -188,6 +215,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         override_reasons = []
         has_override = False
         
+        # 讀取異常表覆寫指令
         if not df_anomaly.empty:
             emp_anomalies = df_anomaly[(df_anomaly['日期'] == date) & (df_anomaly['員工'] == emp)]
             for _, anom in emp_anomalies.iterrows():
@@ -225,6 +253,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                         has_override = True
                         override_reasons.append(f"時數增減 {anom['時數']}H: {reason}")
 
+        # 彙整打卡時間 (包含孤兒紀錄與異常表補登時間)
         all_times = []
         for _, punch in emp_punches.iterrows():
             if pd.notna(punch['上班時間']):
@@ -234,20 +263,35 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         all_times.extend(missing_punch_dts)
         all_times.sort()
         
+        # 防禦升級：處理完全無打卡的覆寫 (例如 -8 小時事假)
         if not is_working and not all_times:
+            if has_override and manual_add_ot != 0:
+                results.append({
+                    "日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, 
+                    "遲到(分)": 0, "早退(分)": 0, "加班(時)": manual_add_ot, "總工時(時)": 0, "狀態": "已套用異常覆寫"
+                })
+                audit_logs.append({
+                    "日期": date, "員工": emp, "原始判定": "排休無打卡", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)
+                })
             continue
             
         if is_working and not all_times:
+            final_status = "已套用異常覆寫" if has_override else "無打卡紀錄(曠職或未核)"
             results.append({
                 "日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, 
-                "遲到(分)": 0, "早退(分)": 0, "加班(時)": 0, "總工時(時)": 0, "狀態": "無打卡紀錄(曠職或未核)"
+                "遲到(分)": 0, "早退(分)": 0, "加班(時)": manual_add_ot, "總工時(時)": 0, "狀態": final_status
             })
+            if has_override:
+                audit_logs.append({
+                    "日期": date, "員工": emp, "原始判定": "曠職或未核", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)
+                })
             continue
 
         actual_in = all_times[0]
         actual_out = all_times[-1]
         span_hours = (actual_out - actual_in).total_seconds() / 3600.0
 
+        # 休假日支援判定引擎
         if not is_working and all_times:
             total_actual_hours = 0
             if len(all_times) % 2 == 0:
@@ -266,8 +310,13 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                 "日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, 
                 "遲到(分)": 0, "早退(分)": 0, "加班(時)": support_ot, "總工時(時)": round(total_actual_hours, 2), "狀態": "休假支援(全額加班)"
             })
+            if has_override:
+                audit_logs.append({
+                    "日期": date, "員工": emp, "原始判定": "休假支援", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)
+                })
             continue
 
+        # PT 正常計算邏輯
         if emp_type == "PT":
             total_actual_hours = 0
             if len(all_times) % 2 == 0:
@@ -284,12 +333,17 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                 "日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, 
                 "遲到(分)": 0, "早退(分)": 0, "加班(時)": manual_add_ot, "總工時(時)": pt_hours, "狀態": final_status
             })
+            if has_override:
+                audit_logs.append({
+                    "日期": date, "員工": emp, "原始判定": "PT工時結算", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)
+                })
             continue
             
         late_mins = 0
         early_leave_mins = 0
         total_calculated_hours = 0
         
+        # 正職正常計算邏輯
         if shift_str == "正常班":
             if actual_in.hour < 13 or len(all_times) >= 4:
                 sched1_in = pd.to_datetime(f"{date} 11:00:00")
@@ -408,6 +462,9 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
 
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
+# ==========================================
+# 介面渲染
+# ==========================================
 st.set_page_config(page_title="IKKON 薪資結算系統", layout="wide")
 st.title("IKKON 薪資自動化結算系統")
 
