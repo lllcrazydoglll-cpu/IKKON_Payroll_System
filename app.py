@@ -60,10 +60,11 @@ def clean_ichef_data(file):
     return pd.DataFrame(cleaned_data), pd.DataFrame(error_log)
 
 # ==========================================
-# 模組二：強固型班表攤平 (包含職別判斷與空白填補)
+# 模組二：強固型班表攤平 (新增：指定工作表讀取)
 # ==========================================
-def parse_roster_data(file):
-    raw_roster = pd.read_excel(file, header=None)
+def parse_roster_data(file, target_sheet):
+    # 邏輯修正：強制系統只讀取使用者指定的那張工作表
+    raw_roster = pd.read_excel(file, sheet_name=target_sheet, header=None)
     roster_list = []
     
     title_row_index = -1
@@ -128,7 +129,7 @@ def parse_roster_data(file):
     return pd.DataFrame(roster_list), ""
 
 # ==========================================
-# 模組三：雙軌薪資運算引擎 (正職與PT分離)
+# 模組三：雙軌薪資運算引擎 
 # ==========================================
 def calculate_payroll_hours(df_roster, df_actual):
     results = []
@@ -152,7 +153,6 @@ def calculate_payroll_hours(df_roster, df_actual):
             })
             continue
             
-        # --- PT 專屬計算邏輯 ---
         if emp_type == "PT":
             total_minutes = 0
             for _, punch in emp_punches.iterrows():
@@ -167,12 +167,10 @@ def calculate_payroll_hours(df_roster, df_actual):
             })
             continue
             
-        # --- 正職計算邏輯 ---
         actual_in = emp_punches['上班時間'].min()
         actual_out = emp_punches['下班時間'].max()
         
         if shift_str == "正常班":
-            # 以打卡時間反推平假日班別
             if actual_in.hour < 13:
                 sched_in = pd.to_datetime(f"{date} 11:00:00")
                 sched_out = pd.to_datetime(f"{date} 23:00:00")
@@ -245,20 +243,32 @@ with col1:
     ichef_file = st.file_uploader("1. 上傳 iCHEF 打卡紀錄", type=["xlsx"], key="ichef")
 with col2:
     roster_file = st.file_uploader("2. 上傳 店鋪當月班表", type=["xlsx"], key="roster")
+    
+    # 防禦機制：讀取 Excel 所有工作表名稱，供經理人明確選擇
+    selected_sheet = None
+    if roster_file:
+        try:
+            xls = pd.ExcelFile(roster_file)
+            sheet_names = xls.sheet_names
+            selected_sheet = st.selectbox("請選擇要結算的班表月份 (工作表)：", sheet_names)
+        except Exception as e:
+            st.error("讀取班表分頁失敗，請確認檔案格式。")
+            
 with col3:
     anomaly_file = st.file_uploader("3. 上傳 幹部打卡異常表", type=["csv", "xlsx"], key="anomaly")
 
-if ichef_file and roster_file:
+if ichef_file and roster_file and selected_sheet:
     if st.button("執行結算與稽核比對"):
         with st.spinner('系統運算中...'):
             df_cleaned, df_error = clean_ichef_data(ichef_file)
-            df_roster, error_msg = parse_roster_data(roster_file)
+            # 傳遞選定的工作表給攤平模組
+            df_roster, error_msg = parse_roster_data(roster_file, selected_sheet)
             
             if error_msg:
                 st.error(error_msg)
             else:
                 df_final_calc = calculate_payroll_hours(df_roster, df_cleaned)
-                st.success("基礎資料解析成功。")
+                st.success(f"已成功鎖定並解析工作表：{selected_sheet}")
                 
                 tab_main, tab_audit, tab_error, tab_roster = st.tabs([
                     "最終出缺勤結算", "異常表覆寫稽核", "原始打卡異常攔截", "系統攤平班表(除錯)"
