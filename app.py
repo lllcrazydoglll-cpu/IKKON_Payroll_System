@@ -60,10 +60,9 @@ def clean_ichef_data(file):
     return pd.DataFrame(cleaned_data), pd.DataFrame(error_log)
 
 # ==========================================
-# 模組二：強固型班表攤平 (新增：指定工作表讀取)
+# 模組二：強固型班表攤平
 # ==========================================
 def parse_roster_data(file, target_sheet):
-    # 邏輯修正：強制系統只讀取使用者指定的那張工作表
     raw_roster = pd.read_excel(file, sheet_name=target_sheet, header=None)
     roster_list = []
     
@@ -129,10 +128,94 @@ def parse_roster_data(file, target_sheet):
     return pd.DataFrame(roster_list), ""
 
 # ==========================================
-# 模組三：雙軌薪資運算引擎 
+# 模組三：幹部打卡異常表 (最高權限覆寫解析)
 # ==========================================
-def calculate_payroll_hours(df_roster, df_actual):
+def parse_anomaly_data(file, target_year):
+    if file is None:
+        return pd.DataFrame()
+        
+    try:
+        if file.name.endswith('.csv'):
+            raw_anomaly = pd.read_csv(file, header=None)
+        else:
+            raw_anomaly = pd.read_excel(file, header=None)
+    except:
+        return pd.DataFrame()
+        
+    anomalies = []
+    header_idx = -1
+    for i, row in raw_anomaly.iterrows():
+        if "姓名" in str(row.values) and "原因" in str(row.values):
+            header_idx = i
+            break
+            
+    if header_idx == -1:
+        return pd.DataFrame()
+        
+    for i in range(header_idx + 1, len(raw_anomaly)):
+        row = raw_anomaly.iloc[i]
+        name = str(row[0]).strip()
+        if name in ["nan", "None", "", "姓名"]:
+            continue
+            
+        status = str(row[1]).strip()
+        reason = str(row[2]).strip()
+        missing_time_str = str(row[3]).strip()
+        
+        month = None
+        day = None
+        for col_idx in range(4, len(row)):
+            val = str(row[col_idx]).strip()
+            if val == "月" and col_idx > 0:
+                month = str(row[col_idx-1]).strip()
+            if val == "日" and col_idx > 0:
+                day = str(row[col_idx-1]).strip()
+                
+        if not month or not day:
+            continue
+            
+        overtime_val = 0.0
+        for col_idx in range(len(row)-1, 4, -1):
+            val = str(row[col_idx]).strip()
+            if val == "小時" and col_idx > 0:
+                ot_str = str(row[col_idx-1]).strip()
+                if ":" in ot_str:
+                    parts = ot_str.split(":")
+                    if len(parts) >= 2:
+                        overtime_val = float(parts[0]) + float(parts[1])/60.0
+                else:
+                    try:
+                        overtime_val = float(ot_str)
+                    except:
+                        pass
+                break
+                
+        try:
+            date_str = f"{target_year}-{int(float(month)):02d}-{int(float(day)):02d}"
+        except:
+            continue
+            
+        parsed_missing_time = None
+        if missing_time_str not in ["nan", "None", ""]:
+            parsed_missing_time = str(missing_time_str).replace("時", "").replace("分", "").strip()
+            
+        anomalies.append({
+            "日期": date_str,
+            "員工": name,
+            "狀態": status,
+            "原因": reason,
+            "補登時間": parsed_missing_time,
+            "核准加班": overtime_val
+        })
+        
+    return pd.DataFrame(anomalies)
+
+# ==========================================
+# 核心引擎：薪資工時碰撞與覆寫結算
+# ==========================================
+def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     results = []
+    audit_logs = []
     
     df_actual['上班時間'] = pd.to_datetime(df_actual['上班時間'])
     df_actual['下班時間'] = pd.to_datetime(df_actual['下班時間'])
@@ -146,30 +229,68 @@ def calculate_payroll_hours(df_roster, df_actual):
         
         emp_punches = df_actual[(df_actual['員工'] == emp) & (df_actual['日期'] == date)]
         
-        if emp_punches.empty:
+        # 異常覆寫機制介入
+        has_override = False
+        manual_add_ot = 0.0
+        override_reason = []
+        missing_punch_dts = []
+        
+        if not df_anomaly.empty:
+            emp_anomalies = df_anomaly[(df_anomaly['日期'] == date) & (df_anomaly['員工'] == emp)]
+            for _, anom in emp_anomalies.iterrows():
+                has_override = True
+                override_reason.append(str(anom['原因']))
+                if pd.notna(anom['核准加班']) and anom['核准加班'] != 0.0:
+                    manual_add_ot += float(anom['核准加班'])
+                if pd.notna(anom['補登時間']) and anom['補登時間']:
+                    try:
+                        time_str = str(anom['補登時間']).strip()
+                        if len(time_str) == 5:
+                            time_str += ":00"
+                        if len(time_str.split(':')) >= 2:
+                            dt = pd.to_datetime(f"{date} {time_str}")
+                            missing_punch_dts.append(dt)
+                    except:
+                        pass
+
+        # 彙整所有實際與補登的打卡時間
+        all_times = []
+        if not emp_punches.empty:
+            all_times.extend(emp_punches['上班時間'].dropna().tolist())
+            all_times.extend(emp_punches['下班時間'].dropna().tolist())
+        all_times.extend(missing_punch_dts)
+        
+        if not all_times:
             results.append({
                 "日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, 
                 "遲到(分)": 0, "早退(分)": 0, "加班(時)": 0, "總工時(時)": 0, "狀態": "無打卡紀錄(休假或未核)"
             })
             continue
             
+        actual_in = min(all_times)
+        actual_out = max(all_times)
+        
+        # --- PT 計算邏輯 ---
         if emp_type == "PT":
-            total_minutes = 0
-            for _, punch in emp_punches.iterrows():
-                mins = (punch['下班時間'] - punch['上班時間']).total_seconds() / 60.0
-                total_minutes += mins
-                
+            total_minutes = (actual_out - actual_in).total_seconds() / 60.0
             pt_hours = (total_minutes // 30) * 0.5
+            pt_hours += manual_add_ot
             
+            final_status = "已套用異常覆寫" if has_override else "PT時數結算"
             results.append({
                 "日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, 
-                "遲到(分)": 0, "早退(分)": 0, "加班(時)": 0, "總工時(時)": pt_hours, "狀態": "PT時數結算"
+                "遲到(分)": 0, "早退(分)": 0, "加班(時)": manual_add_ot, "總工時(時)": pt_hours, "狀態": final_status
             })
+            
+            if has_override:
+                audit_logs.append({
+                    "日期": date, "員工": emp, "原始判定": "PT工時結算", 
+                    "覆寫內容": f"核准加減班: {manual_add_ot}小時 / 補登時間: {len(missing_punch_dts)}筆",
+                    "幹部備註原因": " | ".join(override_reason)
+                })
             continue
             
-        actual_in = emp_punches['上班時間'].min()
-        actual_out = emp_punches['下班時間'].max()
-        
+        # --- 正職計算邏輯 ---
         if shift_str == "正常班":
             if actual_in.hour < 13:
                 sched_in = pd.to_datetime(f"{date} 11:00:00")
@@ -208,10 +329,14 @@ def calculate_payroll_hours(df_roster, df_actual):
             else:
                 early_leave_mins = diff_mins
                 
-        total_actual_hours = 0
-        for _, punch in emp_punches.iterrows():
-            total_actual_hours += (punch['下班時間'] - punch['上班時間']).total_seconds() / 3600.0
-            
+        # 工時運算 (考量補登狀況)
+        if missing_punch_dts:
+            total_actual_hours = (actual_out - actual_in).total_seconds() / 3600.0
+        else:
+            total_actual_hours = 0
+            for _, punch in emp_punches.iterrows():
+                total_actual_hours += (punch['下班時間'] - punch['上班時間']).total_seconds() / 3600.0
+                
         final_calculated_hours = total_actual_hours + welfare_virtual_hours
         
         overtime_hours = 0
@@ -224,12 +349,22 @@ def calculate_payroll_hours(df_roster, df_actual):
         if overflow > 0:
             overtime_hours = (overflow // 0.5) * 0.5
             
+        overtime_hours += manual_add_ot
+        final_status = "已套用異常覆寫" if has_override else "正常結算"
+            
         results.append({
             "日期": date, "員工": emp, "身份": "正職", "班別": shift_str, 
-            "遲到(分)": late_mins, "早退(分)": early_leave_mins, "加班(時)": overtime_hours, "總工時(時)": final_calculated_hours, "狀態": "正常結算"
+            "遲到(分)": late_mins, "早退(分)": early_leave_mins, "加班(時)": overtime_hours, "總工時(時)": final_calculated_hours, "狀態": final_status
         })
+        
+        if has_override:
+            audit_logs.append({
+                "日期": date, "員工": emp, "原始判定": "異常/正常結算", 
+                "覆寫內容": f"核准加減班: {manual_add_ot}小時 / 補登時間: {len(missing_punch_dts)}筆",
+                "幹部備註原因": " | ".join(override_reason)
+            })
 
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
 # 介面渲染
@@ -243,8 +378,6 @@ with col1:
     ichef_file = st.file_uploader("1. 上傳 iCHEF 打卡紀錄", type=["xlsx"], key="ichef")
 with col2:
     roster_file = st.file_uploader("2. 上傳 店鋪當月班表", type=["xlsx"], key="roster")
-    
-    # 防禦機制：讀取 Excel 所有工作表名稱，供經理人明確選擇
     selected_sheet = None
     if roster_file:
         try:
@@ -255,20 +388,25 @@ with col2:
             st.error("讀取班表分頁失敗，請確認檔案格式。")
             
 with col3:
-    anomaly_file = st.file_uploader("3. 上傳 幹部打卡異常表", type=["csv", "xlsx"], key="anomaly")
+    anomaly_file = st.file_uploader("3. 上傳 幹部打卡異常表 (選填)", type=["csv", "xlsx"], key="anomaly")
 
 if ichef_file and roster_file and selected_sheet:
     if st.button("執行結算與稽核比對"):
-        with st.spinner('系統運算中...'):
+        with st.spinner('系統運算與權限覆寫中...'):
             df_cleaned, df_error = clean_ichef_data(ichef_file)
-            # 傳遞選定的工作表給攤平模組
             df_roster, error_msg = parse_roster_data(roster_file, selected_sheet)
             
             if error_msg:
                 st.error(error_msg)
             else:
-                df_final_calc = calculate_payroll_hours(df_roster, df_cleaned)
-                st.success(f"已成功鎖定並解析工作表：{selected_sheet}")
+                target_year = "2026"
+                if not df_roster.empty:
+                    target_year = str(df_roster.iloc[0]['日期'])[:4]
+                    
+                df_anomaly = parse_anomaly_data(anomaly_file, target_year)
+                
+                df_final_calc, df_audit = calculate_payroll_hours(df_roster, df_cleaned, df_anomaly)
+                st.success(f"已成功鎖定工作表：{selected_sheet}，運算與覆寫程序完成。")
                 
                 tab_main, tab_audit, tab_error, tab_roster = st.tabs([
                     "最終出缺勤結算", "異常表覆寫稽核", "原始打卡異常攔截", "系統攤平班表(除錯)"
@@ -278,7 +416,10 @@ if ichef_file and roster_file and selected_sheet:
                     st.dataframe(df_final_calc)
                     
                 with tab_audit:
-                    st.info("尚未實作異常表寫入邏輯，目前為底層淨計算結果。")
+                    if not df_audit.empty:
+                        st.dataframe(df_audit)
+                    else:
+                        st.info("本次結算並未套用任何異常表覆寫紀錄。")
                         
                 with tab_error:
                     if not df_error.empty:
