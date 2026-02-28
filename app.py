@@ -5,8 +5,8 @@ def clean_ichef_data(file):
     cleaned_data = []
     error_log = []
 
-    # 讀取原始檔案，設定 header=None 是防禦機制，因為 iCHEF 原始檔沒有標準的標題列
-    raw_data = pd.read_csv(file, header=None)
+    # 邏輯修正：將 read_csv 更改為 read_excel，直接解析 iCHEF 原始檔
+    raw_data = pd.read_excel(file, header=None)
 
     current_employee = ""
     current_clock_in = None
@@ -15,14 +15,11 @@ def clean_ichef_data(file):
         action = str(row[0]).strip()
         time_record = str(row[1]).strip()
 
-        # 邏輯區塊一：辨識員工姓名與排除雜訊
-        # 增加防禦：排除 iCHEF 報表常出現的「總時數：...」等無關字眼
         if action not in ["上班", "下班", "無下班", "nan", "結帳收銀", "admin"]:
             if "總時數" not in action:
                 current_employee = action
                 current_clock_in = None
 
-        # 邏輯區塊二：處理「上班」
         elif action == "上班":
             if current_clock_in is not None:
                 error_log.append({
@@ -32,7 +29,6 @@ def clean_ichef_data(file):
                 })
             current_clock_in = time_record
 
-        # 邏輯區塊三：處理「下班」
         elif action == "下班":
             if current_clock_in is not None:
                 cleaned_data.append({
@@ -48,7 +44,6 @@ def clean_ichef_data(file):
                     "打卡時間": time_record
                 })
 
-        # 邏輯區塊四：處理「無下班」
         elif "無下班" in action:
             error_log.append({
                 "員工": current_employee,
@@ -64,23 +59,19 @@ st.set_page_config(page_title="IKKON 薪資結算系統", layout="wide")
 st.title("IKKON 薪資自動化結算系統")
 st.markdown("### 模組一：打卡紀錄清洗與異常攔截")
 
-# 建立檔案上傳區塊
-uploaded_file = st.file_uploader("請上傳 iCHEF 打卡紀錄 (CSV格式)", type=["csv"])
+# 介面修正：將上傳限制從 csv 更改為 xlsx
+uploaded_file = st.file_uploader("請上傳 iCHEF 打卡紀錄 (Excel格式 .xlsx)", type=["xlsx"])
 
 if uploaded_file is not None:
-    # 建立執行按鈕
     if st.button("執行資料清洗"):
         with st.spinner('系統處理中...'):
-            # 呼叫上方定義的邏輯函數
             cleaned_data, error_log = clean_ichef_data(uploaded_file)
 
-            # 將結果轉換為資料表格式以便在網頁顯示
             df_cleaned = pd.DataFrame(cleaned_data)
             df_error = pd.DataFrame(error_log)
 
             st.markdown("**處理完成！請核對以下資料：**")
 
-            # 將畫面切割為左右兩塊，便於對照
             col1, col2 = st.columns(2)
 
             with col1:
