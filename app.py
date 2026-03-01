@@ -357,7 +357,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
-# 模組四：最終薪資報表產出引擎 (包含特殊節日加給運算)
+# 模組四：最終薪資報表產出引擎
 # ==========================================
 def parse_salary_params(file):
     try:
@@ -372,7 +372,6 @@ def parse_salary_params(file):
             if col in df_fixed.columns:
                 df_fixed[col] = pd.to_numeric(df_fixed[col], errors='coerce').fillna(0)
                 
-        # 更新防呆識別：尋找包含(時數)的特例欄位
         num_cols_var = ['學習崗位獎金', '團體績效獎金', '職務獎金', '當日激勵獎金', '久任獎金', '支援獎金', '特殊節日加給(時數)']
         for col in num_cols_var:
             if col in df_var.columns:
@@ -415,7 +414,6 @@ def generate_final_payslip(df_calc, df_fixed, df_var):
                 if col in var_record.columns:
                     total_variable_bonus += var_record[col].values[0]
                     
-            # 特殊節日加給：1.5倍時薪自動結算引擎
             if '特殊節日加給(時數)' in var_record.columns:
                 sh_hours = var_record['特殊節日加給(時數)'].values[0]
                 if sh_hours > 0:
@@ -457,14 +455,19 @@ def generate_final_payslip(df_calc, df_fixed, df_var):
     return pd.DataFrame(payslip_data)
 
 # ==========================================
-# 介面渲染
+# 介面渲染：兩階段防禦性解耦架構
 # ==========================================
 st.set_page_config(page_title="IKKON 薪資自動化結算系統", layout="wide")
 st.title("IKKON 薪資自動化結算系統")
 
-col1, col2 = st.columns(2)
+st.markdown("---")
+st.markdown("### 階段一：出缺勤診斷與異常覆寫")
+st.markdown("請先上傳原始打卡資料與班表，進行時間碰撞試算。若有確認之異常，可一併上傳標準化異常表進行覆寫。")
+
+col1, col2, col3 = st.columns(3)
 with col1:
     ichef_file = st.file_uploader("1. 上傳 iCHEF 打卡紀錄", type=["xlsx"], key="ichef")
+with col2:
     roster_file = st.file_uploader("2. 上傳 店鋪當月班表", type=["xlsx"], key="roster")
     selected_sheet = None
     if roster_file:
@@ -474,13 +477,16 @@ with col1:
             selected_sheet = st.selectbox("請選擇班表月份 (工作表)：", sheet_names)
         except Exception as e:
             st.error("讀取班表失敗。")
-with col2:
-    anomaly_file = st.file_uploader("3. 上傳 標準化異常表 (選填)", type=["csv", "xlsx"], key="anomaly")
-    salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表 (選填/結算必備)", type=["xlsx"], key="salary")
+with col3:
+    anomaly_file = st.file_uploader("3. 上傳 標準化異常表 (若無可略過)", type=["csv", "xlsx"], key="anomaly")
+
+# 記憶體狀態存放區
+if 'df_final_calc' not in st.session_state:
+    st.session_state.df_final_calc = pd.DataFrame()
 
 if ichef_file and roster_file and selected_sheet:
-    if st.button("執行全自動薪資結算"):
-        with st.spinner('系統運算與權限覆寫中...'):
+    if st.button("執行第一階段：出缺勤試算"):
+        with st.spinner('進行時間碰撞與異常診斷中...'):
             df_cleaned, df_error = clean_ichef_data(ichef_file)
             df_roster, error_msg = parse_roster_data(roster_file, selected_sheet)
             
@@ -490,20 +496,14 @@ if ichef_file and roster_file and selected_sheet:
                 df_anomaly = parse_standard_anomaly_data(anomaly_file)
                 df_final_calc, df_audit = calculate_payroll_hours(df_roster, df_cleaned, df_anomaly)
                 
-                tab_payslip, tab_main, tab_audit, tab_error, tab_roster = st.tabs([
-                    "最終薪資條", "每日出缺勤明細", "異常表覆寫稽核", "原始打卡異常攔截", "系統攤平班表(除錯)"
-                ])
+                # 將試算結果存入暫存區，供第二階段使用
+                st.session_state.df_final_calc = df_final_calc
                 
-                with tab_payslip:
-                    if salary_param_file:
-                        df_fixed, df_var, err = parse_salary_params(salary_param_file)
-                        if err:
-                            st.error(err)
-                        else:
-                            df_payslip = generate_final_payslip(df_final_calc, df_fixed, df_var)
-                            st.dataframe(df_payslip)
-                    else:
-                        st.info("請上傳「薪資與獎金設定表」以解鎖最終薪資計算功能。")
+                st.success("第一階段運算完成。請於下方報表查閱異常攔截紀錄與每日出缺勤明細。")
+                
+                tab_main, tab_audit, tab_error = st.tabs([
+                    "每日出缺勤明細 (試算結果)", "異常表覆寫稽核", "原始打卡異常攔截 (需人工查核)"
+                ])
                 
                 with tab_main:
                     st.dataframe(df_final_calc)
@@ -512,13 +512,29 @@ if ichef_file and roster_file and selected_sheet:
                     if not df_audit.empty:
                         st.dataframe(df_audit)
                     else:
-                        st.info("本次結算並未套用任何異常表覆寫紀錄。")
+                        st.info("本次試算並未套用任何異常表覆寫紀錄。")
                         
                 with tab_error:
                     if not df_error.empty:
                         st.dataframe(df_error)
                     else:
                         st.write("無任何底層異常紀錄。")
-                        
-                with tab_roster:
-                    st.dataframe(df_roster)
+
+st.markdown("---")
+st.markdown("### 階段二：最終薪資發放")
+st.markdown("確認上方出缺勤時數毫無瑕疵後，請匯入薪資與獎金設定表，執行最終結算。")
+
+salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表 (最終發放必備)", type=["xlsx"], key="salary")
+
+if salary_param_file and not st.session_state.df_final_calc.empty:
+    if st.button("執行第二階段：產出最終薪資條"):
+        with st.spinner('結合薪資基準與浮動獎金結算中...'):
+            df_fixed, df_var, err = parse_salary_params(salary_param_file)
+            if err:
+                st.error(err)
+            else:
+                df_payslip = generate_final_payslip(st.session_state.df_final_calc, df_fixed, df_var)
+                st.success("薪資條產出完畢。")
+                st.dataframe(df_payslip)
+elif salary_param_file and st.session_state.df_final_calc.empty:
+    st.warning("請先完成「第一階段：出缺勤試算」，再執行薪資發放。")
