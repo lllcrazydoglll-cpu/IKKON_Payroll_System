@@ -351,30 +351,29 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         overtime_hours += manual_add_ot
         final_status = "已套用異常覆寫" if has_override else "正常結算"
             
-        results.append({"日期": date, "員工": emp, "身份": "正職", "班別": shift_str, "遲到(分)": late_mins, "早早(分)": early_leave_mins, "加班(時)": overtime_hours, "總工時(時)": round(total_calculated_hours, 2), "狀態": final_status})
+        results.append({"日期": date, "員工": emp, "身份": "正職", "班別": shift_str, "遲到(分)": late_mins, "早退(分)": early_leave_mins, "加班(時)": overtime_hours, "總工時(時)": round(total_calculated_hours, 2), "狀態": final_status})
         if has_override: audit_logs.append({"日期": date, "員工": emp, "原始判定": "異常/正常結算", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)})
 
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
-# 模組四：最終薪資報表產出引擎
+# 模組四：最終薪資報表產出引擎 (包含特殊節日加給運算)
 # ==========================================
 def parse_salary_params(file):
     try:
         df_fixed = pd.read_excel(file, sheet_name="固定參數")
         df_var = pd.read_excel(file, sheet_name="本月浮動獎金")
         
-        # 清理欄位名稱空白
         df_fixed.columns = df_fixed.columns.str.strip()
         df_var.columns = df_var.columns.str.strip()
         
-        # 數值欄位填零防呆
         num_cols_fixed = ['本薪或時薪', '勞保扣款', '健保扣款', '租屋補助']
         for col in num_cols_fixed:
             if col in df_fixed.columns:
                 df_fixed[col] = pd.to_numeric(df_fixed[col], errors='coerce').fillna(0)
                 
-        num_cols_var = ['學習崗位獎金', '團體績效獎金', '職務獎金', '當日激勵獎金', '久任獎金', '支援獎金', '特殊節日加給']
+        # 更新防呆識別：尋找包含(時數)的特例欄位
+        num_cols_var = ['學習崗位獎金', '團體績效獎金', '職務獎金', '當日激勵獎金', '久任獎金', '支援獎金', '特殊節日加給(時數)']
         for col in num_cols_var:
             if col in df_var.columns:
                 df_var[col] = pd.to_numeric(df_var[col], errors='coerce').fillna(0)
@@ -384,18 +383,13 @@ def parse_salary_params(file):
         return None, None, "薪資與獎金設定表讀取失敗，請確認檔案包含「固定參數」與「本月浮動獎金」兩個工作表。"
 
 def generate_final_payslip(df_calc, df_fixed, df_var):
-    # 彙總員工本月出勤數據
     summary = df_calc.groupby('員工').agg({
         '遲到(分)': 'sum',
-        '早退(分)': 'sum' if '早退(分)' in df_calc.columns else lambda x: sum(df_calc.get('早早(分)', x)), # 相容前文變數名
+        '早退(分)': 'sum',
         '加班(時)': 'sum',
         '總工時(時)': 'sum',
         '身份': 'first'
     }).reset_index()
-    
-    # 確保早退欄位名稱一致性
-    if '早早(分)' in summary.columns:
-        summary.rename(columns={'早早(分)': '早退(分)'}, inplace=True)
     
     payslip_data = []
     
@@ -411,35 +405,34 @@ def generate_final_payslip(df_calc, df_fixed, df_var):
         health_ins = fixed_record['健保扣款'].values[0] if not fixed_record.empty and '健保扣款' in fixed_record.columns else 0
         rent_subsidy = fixed_record['租屋補助'].values[0] if not fixed_record.empty and '租屋補助' in fixed_record.columns else 0
         
+        hourly_rate = round(base_salary_or_hourly / 240.0) if emp_type == "正職" and base_salary_or_hourly > 0 else base_salary_or_hourly
+        
         total_variable_bonus = 0
-        bonus_details = {}
+        special_holiday_bonus = 0
+        
         if not var_record.empty:
-            for col in ['學習崗位獎金', '團體績效獎金', '職務獎金', '當日激勵獎金', '久任獎金', '支援獎金', '特殊節日加給']:
+            for col in ['學習崗位獎金', '團體績效獎金', '職務獎金', '當日激勵獎金', '久任獎金', '支援獎金']:
                 if col in var_record.columns:
-                    val = var_record[col].values[0]
-                    total_variable_bonus += val
-                    bonus_details[col] = val
+                    total_variable_bonus += var_record[col].values[0]
                     
-        # 薪資數學引擎
+            # 特殊節日加給：1.5倍時薪自動結算引擎
+            if '特殊節日加給(時數)' in var_record.columns:
+                sh_hours = var_record['特殊節日加給(時數)'].values[0]
+                if sh_hours > 0:
+                    special_holiday_bonus = round(hourly_rate * sh_hours * 1.5)
+                    total_variable_bonus += special_holiday_bonus
+
         if emp_type == "PT":
-            hourly_rate = base_salary_or_hourly
             base_pay = 0
             time_deduction = 0
-            ot_pay = 0
             work_pay = round(emp_data['總工時(時)'] * hourly_rate)
-            # PT 若有額外核准加班，亦計入
             ot_pay = round(emp_data['加班(時)'] * hourly_rate) 
             gross_pay = work_pay + ot_pay + rent_subsidy + total_variable_bonus
-        else: # 正職
-            hourly_rate = round(base_salary_or_hourly / 240.0) if base_salary_or_hourly > 0 else 0
+        else:
             base_pay = base_salary_or_hourly
-            # 遲到與早退依分鐘數精準扣除
             total_penalty_mins = emp_data['遲到(分)'] + emp_data['早退(分)']
             time_deduction = round(total_penalty_mins * (hourly_rate / 60.0))
-            
-            # 加班費精確計算 (含事假負數抵扣)
             ot_pay = round(emp_data['加班(時)'] * hourly_rate)
-            
             gross_pay = base_pay + ot_pay + rent_subsidy + total_variable_bonus - time_deduction
             
         net_pay = gross_pay - labor_ins - health_ins
@@ -450,7 +443,8 @@ def generate_final_payslip(df_calc, df_fixed, df_var):
             "精算時薪": hourly_rate,
             "本薪/PT基礎薪": base_pay if emp_type == "正職" else work_pay,
             "加班時數": emp_data['加班(時)'],
-            "加班加減給": ot_pay,
+            "加班加給": ot_pay,
+            "特殊節日加成金額": special_holiday_bonus,
             "遲到早退合計(分)": emp_data['遲到(分)'] + emp_data['早退(分)'],
             "出勤扣款": -time_deduction if time_deduction > 0 else 0,
             "各項獎金總計": total_variable_bonus,
