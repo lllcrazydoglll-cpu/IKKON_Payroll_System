@@ -214,6 +214,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
             for _, anom in emp_anomalies.iterrows():
                 cmd = anom['指令']
                 reason = str(anom['原因'])
+                time_ctx = str(anom['時間']).strip() if pd.notna(anom['時間']) else ""
                 
                 if cmd == "變更為排休":
                     shift_str = "休"
@@ -226,8 +227,8 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     has_override = True
                     override_reasons.append(f"調休變更: {reason}")
                 elif cmd in ["補登上班", "補登下班", "上班補登", "下班補登"]:
-                    if pd.notna(anom['時間']):
-                        ts = str(anom['時間']).strip()
+                    if time_ctx:
+                        ts = time_ctx
                         if len(ts) == 5: ts += ":00"
                         try:
                             dt = pd.to_datetime(f"{date} {ts}")
@@ -239,7 +240,11 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     if anom['時數'] != 0.0:
                         manual_add_ot += anom['時數']
                         has_override = True
-                        override_reasons.append(f"時數增減 {anom['時數']}H: {reason}")
+                        # 將時間區段寫入稽核紀錄，方便人類核對
+                        if time_ctx and time_ctx.lower() not in ["nan", "none", ""]:
+                            override_reasons.append(f"時數增減 {anom['時數']}H [{time_ctx}]: {reason}")
+                        else:
+                            override_reasons.append(f"時數增減 {anom['時數']}H: {reason}")
 
         all_times = []
         for _, punch in emp_punches.iterrows():
@@ -480,7 +485,6 @@ with col2:
 with col3:
     anomaly_file = st.file_uploader("3. 上傳 標準化異常表 (若無可略過)", type=["csv", "xlsx"], key="anomaly")
 
-# 記憶體狀態存放區
 if 'df_final_calc' not in st.session_state:
     st.session_state.df_final_calc = pd.DataFrame()
 
@@ -496,7 +500,6 @@ if ichef_file and roster_file and selected_sheet:
                 df_anomaly = parse_standard_anomaly_data(anomaly_file)
                 df_final_calc, df_audit = calculate_payroll_hours(df_roster, df_cleaned, df_anomaly)
                 
-                # 將試算結果存入暫存區，供第二階段使用
                 st.session_state.df_final_calc = df_final_calc
                 
                 st.success("第一階段運算完成。請於下方報表查閱異常攔截紀錄與每日出缺勤明細。")
