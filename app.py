@@ -4,7 +4,6 @@ import math
 import io
 import zipfile
 import os
-import urllib.request
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timedelta
 
@@ -457,7 +456,6 @@ def parse_salary_params(file):
             if col in df_fixed.columns:
                 df_fixed[col] = pd.to_numeric(df_fixed[col], errors='coerce').fillna(0)
                 
-        # 動態掃描時，防禦性排除「部門」與「姓名」等文字欄位
         exclude_cols = ['部門', '員工姓名', '特殊節日加給(時數)']
         dynamic_bonus_cols = [c for c in df_var.columns if c not in exclude_cols]
         
@@ -537,7 +535,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
             "加班時數": emp_data['加班(時)'],
             "加班加給": ot_pay,
             "動態獎金明細": earned_bonuses,
-            "特殊節日加成金額": special_holiday_bonus, # 供會計總表使用
+            "特殊節日加成金額": special_holiday_bonus,
             "遲到早退合計(分)": emp_data['遲到(分)'] + emp_data['早退(分)'],
             "出勤扣款": -time_deduction if time_deduction > 0 else 0,
             "各項獎金總計": total_variable_bonus,
@@ -570,7 +568,6 @@ def generate_accounting_excel(payslip_records, revenue):
     }
     df_summary = pd.DataFrame(summary_data)
     
-    # 產出供會計留底的詳細表，隱藏不必要的物件欄位
     df_detailed = df.drop(columns=['動態獎金明細'])
     
     output = io.BytesIO()
@@ -578,7 +575,6 @@ def generate_accounting_excel(payslip_records, revenue):
         df_summary.to_excel(writer, sheet_name='會計統計報表', index=False)
         df_detailed.to_excel(writer, sheet_name='員工薪資明細', index=False)
         
-        # 調整 Excel 欄寬，讓會計看得更舒服
         worksheet1 = writer.sheets['會計統計報表']
         worksheet1.set_column('A:A', 30)
         worksheet1.set_column('B:B', 20)
@@ -731,13 +727,23 @@ def create_zip_archive_images(payslips, month_str, custom_msg):
     return zip_buffer.getvalue()
 
 # ==========================================
-# 介面渲染：兩階段防禦性解耦架構
+# 介面渲染：兩階段防禦性解耦架構 (Session State 保護)
 # ==========================================
 st.set_page_config(page_title="IKKON 薪資自動化結算系統", layout="wide")
 st.title("IKKON 薪資自動化結算系統")
 
 if not os.path.exists("NotoSansTC-Regular.ttf"):
     st.error("系統警告：尚未偵測到中文字體檔 (NotoSansTC-Regular.ttf)。請將該檔案上傳至 GitHub，否則產出的薪資圖檔將會顯示為亂碼。")
+
+# 初始化所有的保險箱 (Session State)
+if 'df_final_calc' not in st.session_state:
+    st.session_state.df_final_calc = pd.DataFrame()
+if 'stage2_done' not in st.session_state:
+    st.session_state.stage2_done = False
+if 'zip_data' not in st.session_state:
+    st.session_state.zip_data = None
+if 'excel_data' not in st.session_state:
+    st.session_state.excel_data = None
 
 st.markdown("---")
 st.markdown("### 階段一：出缺勤診斷與異常覆寫")
@@ -766,9 +772,6 @@ with col3:
         except Exception as e:
             st.error("讀取異常表分頁失敗。")
 
-if 'df_final_calc' not in st.session_state:
-    st.session_state.df_final_calc = pd.DataFrame()
-
 if ichef_file and roster_file and selected_sheet:
     if st.button("執行第一階段：出缺勤試算"):
         with st.spinner('進行時間碰撞與異常診斷中...'):
@@ -782,6 +785,11 @@ if ichef_file and roster_file and selected_sheet:
                 df_final_calc, df_audit = calculate_payroll_hours(df_roster, df_cleaned, df_anomaly)
                 
                 st.session_state.df_final_calc = df_final_calc
+                # 若重新執行第一階段，必須重置第二階段的保險箱
+                st.session_state.stage2_done = False
+                st.session_state.zip_data = None
+                st.session_state.excel_data = None
+                
                 st.success("第一階段運算完成。請於下方報表查閱異常攔截紀錄與每日出缺勤明細。")
                 
                 tab_main, tab_audit, tab_error = st.tabs([
@@ -819,29 +827,30 @@ if salary_param_file and not st.session_state.df_final_calc.empty:
             else:
                 payslip_records = generate_final_payslip(st.session_state.df_final_calc, df_fixed, df_var, dyn_cols)
                 
-                # 產出員工 JPG 壓縮檔
-                zip_data = create_zip_archive_images(payslip_records, selected_sheet, custom_msg)
-                
-                # 產出會計 Excel 總表
-                excel_data = generate_accounting_excel(payslip_records, revenue_input)
-                
-                st.success("結算與繪製完成！請點擊下方按鈕下載檔案。")
-                
-                dl_col1, dl_col2 = st.columns(2)
-                with dl_col1:
-                    st.download_button(
-                        label="📥 下載全體員工 JPG 薪資圖檔 (ZIP)",
-                        data=zip_data,
-                        file_name=f"IKKON_薪資圖檔_{selected_sheet}.zip",
-                        mime="application/zip"
-                    )
-                with dl_col2:
-                    st.download_button(
-                        label="📊 下載會計結算總表 (Excel)",
-                        data=excel_data,
-                        file_name=f"IKKON_會計結算總表_{selected_sheet}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                # 產出檔案並將其鎖入保險箱
+                st.session_state.zip_data = create_zip_archive_images(payslip_records, selected_sheet, custom_msg)
+                st.session_state.excel_data = generate_accounting_excel(payslip_records, revenue_input)
+                st.session_state.stage2_done = True
+
+    # 將按鈕的顯示邏輯拉出 st.button 外面，藉由保險箱狀態來控制顯示
+    if st.session_state.get('stage2_done') and st.session_state.get('zip_data') and st.session_state.get('excel_data'):
+        st.success("結算與繪製完成！請點擊下方按鈕下載檔案。")
+        
+        dl_col1, dl_col2 = st.columns(2)
+        with dl_col1:
+            st.download_button(
+                label="📥 下載全體員工 JPG 薪資圖檔 (ZIP)",
+                data=st.session_state.zip_data,
+                file_name=f"IKKON_薪資圖檔_{selected_sheet}.zip",
+                mime="application/zip"
+            )
+        with dl_col2:
+            st.download_button(
+                label="📊 下載會計結算總表 (Excel)",
+                data=st.session_state.excel_data,
+                file_name=f"IKKON_會計結算總表_{selected_sheet}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
 elif salary_param_file and st.session_state.df_final_calc.empty:
     st.warning("請先完成「第一階段：出缺勤試算」，再執行薪資發放。")
