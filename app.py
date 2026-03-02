@@ -4,6 +4,7 @@ import math
 import io
 import zipfile
 import os
+import urllib.request
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timedelta
 
@@ -441,7 +442,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
-# 模組四：最終薪資報表產出引擎
+# 模組四：最終薪資與會計報表產出引擎
 # ==========================================
 def parse_salary_params(file):
     try:
@@ -456,7 +457,8 @@ def parse_salary_params(file):
             if col in df_fixed.columns:
                 df_fixed[col] = pd.to_numeric(df_fixed[col], errors='coerce').fillna(0)
                 
-        exclude_cols = ['員工姓名', '特殊節日加給(時數)']
+        # 動態掃描時，防禦性排除「部門」與「姓名」等文字欄位
+        exclude_cols = ['部門', '員工姓名', '特殊節日加給(時數)']
         dynamic_bonus_cols = [c for c in df_var.columns if c not in exclude_cols]
         
         for col in dynamic_bonus_cols + (['特殊節日加給(時數)'] if '特殊節日加給(時數)' in df_var.columns else []):
@@ -464,7 +466,7 @@ def parse_salary_params(file):
                 
         return df_fixed, df_var, dynamic_bonus_cols, ""
     except Exception as e:
-        return None, None, None, "薪資與獎金設定表讀取失敗，請確認檔案包含「固定參數」與「本月浮動獎金」兩個工作表。"
+        return None, None, None, "薪資與獎金設定表讀取失敗，請確認檔案結構。"
 
 def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
     summary = df_calc.groupby('員工').agg({
@@ -535,10 +537,12 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
             "加班時數": emp_data['加班(時)'],
             "加班加給": ot_pay,
             "動態獎金明細": earned_bonuses,
+            "特殊節日加成金額": special_holiday_bonus, # 供會計總表使用
             "遲到早退合計(分)": emp_data['遲到(分)'] + emp_data['早退(分)'],
             "出勤扣款": -time_deduction if time_deduction > 0 else 0,
             "各項獎金總計": total_variable_bonus,
             "租屋補助": rent_subsidy,
+            "應發薪資(毛額)": gross_pay,
             "勞健保扣款": -(labor_ins + health_ins) if (labor_ins + health_ins) > 0 else 0,
             "本月實領薪資": net_pay
         }
@@ -547,7 +551,42 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
     return payslip_data
 
 # ==========================================
-# 模組五：絕對防禦 JPG 薪資圖檔生成引擎 (支援長結語自動換行)
+# 模組五：會計統計總表產生器
+# ==========================================
+def generate_accounting_excel(payslip_records, revenue):
+    df = pd.DataFrame(payslip_records)
+    
+    ft_total = df[df['身份'] == '正職']['應發薪資(毛額)'].sum()
+    pt_total = df[df['身份'] == 'PT']['應發薪資(毛額)'].sum()
+    ot_total = df['加班加給'].sum()
+    bonus_total = df['各項獎金總計'].sum()
+    
+    total_cost = ft_total + pt_total
+    cost_ratio = f"{(total_cost / revenue * 100):.2f}%" if revenue > 0 else "0%"
+    
+    summary_data = {
+        "統計項目": ["本月營業總額", "總人事成本 (正職+兼職)", "人事成本佔比", "正職薪資合計 (含獎金加班)", "兼職(PT)薪資合計 (含獎金)", "全體加班費合計", "全體各項獎金合計"],
+        "金額 / 數據": [f"{int(revenue):,}", f"{int(total_cost):,}", cost_ratio, f"{int(ft_total):,}", f"{int(pt_total):,}", f"{int(ot_total):,}", f"{int(bonus_total):,}"]
+    }
+    df_summary = pd.DataFrame(summary_data)
+    
+    # 產出供會計留底的詳細表，隱藏不必要的物件欄位
+    df_detailed = df.drop(columns=['動態獎金明細'])
+    
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df_summary.to_excel(writer, sheet_name='會計統計報表', index=False)
+        df_detailed.to_excel(writer, sheet_name='員工薪資明細', index=False)
+        
+        # 調整 Excel 欄寬，讓會計看得更舒服
+        worksheet1 = writer.sheets['會計統計報表']
+        worksheet1.set_column('A:A', 30)
+        worksheet1.set_column('B:B', 20)
+        
+    return output.getvalue()
+
+# ==========================================
+# 模組六：絕對防禦 JPG 薪資圖檔生成引擎 (支援長結語)
 # ==========================================
 def get_text_width(draw, text, font):
     try:
@@ -559,7 +598,6 @@ def get_text_width(draw, text, font):
         except AttributeError:
             return draw.textsize(text, font=font)[0]
 
-# 智慧斷行模組：將長字串依據畫布寬度自動切分為多行
 def split_text_into_lines(text, max_chars_per_line=22):
     lines = []
     while len(text) > max_chars_per_line:
@@ -571,7 +609,6 @@ def split_text_into_lines(text, max_chars_per_line=22):
 
 def create_payslip_image(record, month_str, custom_msg):
     font_path = "NotoSansTC-Regular.ttf"
-    
     try:
         font = ImageFont.truetype(font_path, 20)
         font_title = ImageFont.truetype(font_path, 26)
@@ -581,16 +618,12 @@ def create_payslip_image(record, month_str, custom_msg):
         font_title = font
         font_bold = font
 
-    # 結語斷行預處理與高度探測
     msg_lines = []
     if custom_msg:
-        # 如果使用者自己有按 Enter 換行，先拆開
         raw_lines = custom_msg.split('\n')
         for raw_l in raw_lines:
-            # 針對每一段再做字數長度裁切
             msg_lines.extend(split_text_into_lines(raw_l, 24))
 
-    # 動態計算畫布高度 (基本高度 + 獎金數量擴充 + 長結語擴充)
     base_h = 700
     bonus_count = len(record['動態獎金明細'])
     msg_count = len(msg_lines)
@@ -679,15 +712,12 @@ def create_payslip_image(record, month_str, custom_msg):
     y += 10
     line_heavy()
 
-    # 印出完美斷行的結語
     if msg_lines:
         y += 10
         for line in msg_lines:
             text_center(line, f=font_bold)
 
-    # 根據最終 Y 座標完美裁切畫布底部
     img = img.crop((0, 0, 550, y + 20))
-
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format='JPEG', quality=95)
     return img_byte_arr.getvalue()
@@ -707,7 +737,7 @@ st.set_page_config(page_title="IKKON 薪資自動化結算系統", layout="wide"
 st.title("IKKON 薪資自動化結算系統")
 
 if not os.path.exists("NotoSansTC-Regular.ttf"):
-    st.error("系統警告：尚未偵測到中文字體檔 (NotoSansTC-Regular.ttf)。請將該字體檔案上傳至 GitHub，否則產出的薪資圖檔將會顯示為亂碼。")
+    st.error("系統警告：尚未偵測到中文字體檔 (NotoSansTC-Regular.ttf)。請將該檔案上傳至 GitHub，否則產出的薪資圖檔將會顯示為亂碼。")
 
 st.markdown("---")
 st.markdown("### 階段一：出缺勤診斷與異常覆寫")
@@ -760,44 +790,58 @@ if ichef_file and roster_file and selected_sheet:
                 
                 with tab_main: 
                     st.dataframe(df_final_calc)
-                    
                 with tab_audit: 
-                    if not df_audit.empty:
-                        st.dataframe(df_audit)
-                    else:
-                        st.info("本次無覆寫紀錄。")
-                        
+                    if not df_audit.empty: st.dataframe(df_audit)
+                    else: st.info("本次無覆寫紀錄。")
                 with tab_error: 
-                    if not df_error.empty:
-                        st.dataframe(df_error)
-                    else:
-                        st.write("無異常紀錄。")
+                    if not df_error.empty: st.dataframe(df_error)
+                    else: st.write("無異常紀錄。")
 
 st.markdown("---")
-st.markdown("### 階段二：圖形化薪資單產出")
+st.markdown("### 階段二：圖形化薪資單產出與會計報表")
 
-st.markdown("##### 薪資單發放設定")
-custom_msg = st.text_area("給同仁的當月結語 (支援多行輸入，將印在圖檔最下方)：", value="辛苦了，謝謝你本月的付出！", height=100)
-salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表", type=["xlsx"], key="salary")
+col_a, col_b = st.columns(2)
+with col_a:
+    st.markdown("##### 1. 會計核算參數")
+    revenue_input = st.number_input("請輸入本月營業總額 (供計算人事成本佔比)：", min_value=0, value=0, step=1000)
+    salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表", type=["xlsx"], key="salary")
+    
+with col_b:
+    st.markdown("##### 2. 薪資單發放設定")
+    custom_msg = st.text_area("給同仁的當月結語 (將印在圖檔最下方)：", value="辛苦了，謝謝你本月的付出！", height=120)
 
 if salary_param_file and not st.session_state.df_final_calc.empty:
-    if st.button("執行第二階段：產出 JPG 薪資單"):
-        with st.spinner('繪製高解析度薪資明細表中...'):
+    if st.button("執行第二階段：產出 JPG 薪資單與會計報表"):
+        with st.spinner('結合薪資基準繪製圖檔與結算會計報表中...'):
             df_fixed, df_var, dyn_cols, err = parse_salary_params(salary_param_file)
             if err:
                 st.error(err)
             else:
                 payslip_records = generate_final_payslip(st.session_state.df_final_calc, df_fixed, df_var, dyn_cols)
                 
+                # 產出員工 JPG 壓縮檔
                 zip_data = create_zip_archive_images(payslip_records, selected_sheet, custom_msg)
                 
-                st.success("繪製完成！點擊下方按鈕即可下載全體員工的 JPG 圖檔。")
-                st.download_button(
-                    label="📥 下載全體員工 JPG 薪資圖檔 (ZIP 壓縮檔)",
-                    data=zip_data,
-                    file_name=f"IKKON_薪資圖檔_{selected_sheet}.zip",
-                    mime="application/zip"
-                )
+                # 產出會計 Excel 總表
+                excel_data = generate_accounting_excel(payslip_records, revenue_input)
+                
+                st.success("結算與繪製完成！請點擊下方按鈕下載檔案。")
+                
+                dl_col1, dl_col2 = st.columns(2)
+                with dl_col1:
+                    st.download_button(
+                        label="📥 下載全體員工 JPG 薪資圖檔 (ZIP)",
+                        data=zip_data,
+                        file_name=f"IKKON_薪資圖檔_{selected_sheet}.zip",
+                        mime="application/zip"
+                    )
+                with dl_col2:
+                    st.download_button(
+                        label="📊 下載會計結算總表 (Excel)",
+                        data=excel_data,
+                        file_name=f"IKKON_會計結算總表_{selected_sheet}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
 
 elif salary_param_file and st.session_state.df_final_calc.empty:
     st.warning("請先完成「第一階段：出缺勤試算」，再執行薪資發放。")
