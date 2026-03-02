@@ -140,7 +140,7 @@ def parse_roster_data(file, target_sheet):
     return pd.DataFrame(roster_list), ""
 
 # ==========================================
-# 模組三：異常表解析引擎 (含自我糾錯機制)
+# 模組三：支援 7 欄位新版異常表解析引擎
 # ==========================================
 def parse_standard_anomaly_data(file):
     if file is None:
@@ -155,7 +155,8 @@ def parse_standard_anomaly_data(file):
         anomalies = []
         for index, row in df.iterrows():
             date_val = str(row.iloc[0]).strip()
-            if "202" in date_val and len(row) >= 5:
+            # 支援 7 個欄位的新版設計
+            if "202" in date_val and len(row) >= 6:
                 try:
                     dt = pd.to_datetime(date_val)
                     date_str = dt.strftime('%Y-%m-%d')
@@ -164,50 +165,25 @@ def parse_standard_anomaly_data(file):
                     
                 name = str(row.iloc[1]).strip()
                 command = str(row.iloc[2]).strip()
-                time_val = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
-                hours_val = str(row.iloc[4]).strip() if pd.notna(row.iloc[4]) else ""
-                reason = str(row.iloc[5]).strip() if len(row) > 5 and pd.notna(row.iloc[5]) else ""
+                exact_time = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
+                time_range = str(row.iloc[4]).strip() if pd.notna(row.iloc[4]) else ""
+                hours_val = str(row.iloc[5]).strip() if pd.notna(row.iloc[5]) else ""
+                reason = str(row.iloc[6]).strip() if len(row) > 6 and pd.notna(row.iloc[6]) else ""
                 
                 hours_float = 0.0
-                time_ctx = ""
                 
-                # 智慧型解析：防止使用者將時間區段填入時數欄位
                 if hours_val not in ["nan", "None", ""]:
                     try:
                         hours_float = float(hours_val)
-                        time_ctx = time_val
                     except ValueError:
-                        if "-" in hours_val or "~" in hours_val or ":" in hours_val:
-                            def calc_h(t_str):
-                                try:
-                                    t_str = t_str.replace("~", "-")
-                                    start_s, end_s = t_str.split('-')
-                                    t1 = pd.to_datetime(start_s.strip())
-                                    t2 = pd.to_datetime(end_s.strip())
-                                    if t2 < t1: t2 += timedelta(days=1)
-                                    return (t2 - t1).total_seconds() / 3600.0
-                                except: return None
-                            res = calc_h(hours_val)
-                            if res is not None:
-                                hours_float = res
-                                time_ctx = hours_val
-                            else:
-                                time_ctx = hours_val
-                        else:
-                            time_ctx = hours_val
-                            
-                if time_val not in ["nan", "None", ""] and hours_float == 0.0:
-                    try:
-                        hours_float = float(time_val)
-                        time_ctx = hours_val
-                    except:
-                        if not time_ctx: time_ctx = time_val
+                        hours_float = 0.0
                         
                 anomalies.append({
                     "日期": date_str,
                     "員工": name,
                     "指令": command,
-                    "時間": time_ctx if time_ctx not in ["nan", "None", ""] else None,
+                    "精確時間": exact_time if exact_time not in ["nan", "None", ""] else None,
+                    "時數異動脈絡": time_range if time_range not in ["nan", "None", ""] else None,
                     "時數": hours_float,
                     "原因": reason
                 })
@@ -247,7 +223,8 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
             for _, anom in emp_anomalies.iterrows():
                 cmd = anom['指令']
                 reason = str(anom['原因'])
-                time_ctx = str(anom['時間']).strip() if pd.notna(anom['時間']) else ""
+                exact_time = str(anom['精確時間']).strip() if pd.notna(anom['精確時間']) else ""
+                time_range = str(anom['時數異動脈絡']).strip() if pd.notna(anom['時數異動脈絡']) else ""
                 
                 if cmd == "變更為排休":
                     shift_str = "休"
@@ -260,8 +237,8 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     has_override = True
                     override_reasons.append(f"調休變更: {reason}")
                 elif cmd in ["補登上班", "補登下班", "上班補登", "下班補登"]:
-                    if time_ctx:
-                        ts = time_ctx
+                    if exact_time:
+                        ts = exact_time
                         if len(ts) == 5: ts += ":00"
                         try:
                             dt = pd.to_datetime(f"{date} {ts}")
@@ -273,8 +250,9 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     if anom['時數'] != 0.0:
                         manual_add_ot += anom['時數']
                         has_override = True
-                        if time_ctx and time_ctx.lower() not in ["nan", "none", ""]:
-                            override_reasons.append(f"時數增減 {anom['時數']}H [{time_ctx}]: {reason}")
+                        # 結合人類可讀的時間脈絡印出
+                        if time_range and time_range.lower() not in ["nan", "none", ""]:
+                            override_reasons.append(f"時數增減 {anom['時數']}H [{time_range}]: {reason}")
                         else:
                             override_reasons.append(f"時數增減 {anom['時數']}H: {reason}")
 
@@ -314,7 +292,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
             if has_override: audit_logs.append({"日期": date, "員工": emp, "原始判定": "休假支援", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)})
             continue
 
-        # PT 全新邊界裁切計算邏輯
         if emp_type == "PT":
             total_actual_hours = 0
             if shift_str == "1100-2200":
@@ -353,7 +330,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
             else:
                 total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
 
-            # 防禦浮點數運算誤差
             pt_mins = round(total_actual_hours * 60.0, 2)
             pt_hours = (pt_mins // 30) * 0.5
             pt_hours += manual_add_ot
@@ -559,7 +535,7 @@ with col2:
         except Exception as e:
             st.error("讀取班表失敗。")
 with col3:
-    anomaly_file = st.file_uploader("3. 上傳 標準化異常表 (若無可略過)", type=["csv", "xlsx"], key="anomaly")
+    anomaly_file = st.file_uploader("3. 上傳 7欄位新版異常表 (若無可略過)", type=["csv", "xlsx"], key="anomaly")
 
 if 'df_final_calc' not in st.session_state:
     st.session_state.df_final_calc = pd.DataFrame()
