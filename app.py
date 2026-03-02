@@ -4,7 +4,6 @@ import math
 import io
 import zipfile
 import os
-import urllib.request
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timedelta
 
@@ -495,6 +494,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
         
         earned_bonuses = {}
         total_variable_bonus = 0
+        special_holiday_bonus = 0
         
         if not var_record.empty:
             for col in dynamic_bonus_cols:
@@ -547,7 +547,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
     return payslip_data
 
 # ==========================================
-# 模組五：JPG 薪資圖檔生成引擎 (ATM明細表完美對齊排版)
+# 模組五：絕對防禦 JPG 薪資圖檔生成引擎
 # ==========================================
 def get_text_width(draw, text, font):
     try:
@@ -560,30 +560,23 @@ def get_text_width(draw, text, font):
             return draw.textsize(text, font=font)[0]
 
 def create_payslip_image(record, month_str, custom_msg):
+    # 強制讀取本地字體檔，杜絕網路中斷導致的亂碼
     font_path = "NotoSansTC-Regular.ttf"
-    # 自動下載 Google 開源字體，防止中文變成方塊亂碼
-    if not os.path.exists(font_path):
-        try:
-            url = "https://github.com/google/fonts/raw/main/ofl/notosanstc/NotoSansTC-Regular.ttf"
-            urllib.request.urlretrieve(url, font_path)
-        except:
-            pass
-
+    
     try:
         font = ImageFont.truetype(font_path, 20)
         font_title = ImageFont.truetype(font_path, 26)
         font_bold = ImageFont.truetype(font_path, 22)
-    except:
+    except OSError:
+        # 如果你忘記上傳檔案，系統會發出警告，而不是崩潰
         font = ImageFont.load_default()
         font_title = font
         font_bold = font
 
-    # 動態計算畫布高度 (隨著獎金數量延伸)
     base_h = 700
     bonus_count = len(record['動態獎金明細'])
     img_h = base_h + (bonus_count * 35)
 
-    # 建立純白畫布
     img = Image.new('RGB', (550, img_h), color='#FFFFFF')
     draw = ImageDraw.Draw(img)
 
@@ -616,11 +609,9 @@ def create_payslip_image(record, month_str, custom_msg):
         nonlocal y
         draw.text((margin, y), label, font=f, fill="#000000")
         w = get_text_width(draw, str(val), f)
-        # 精準靠右對齊
         draw.text((right - w, y), str(val), font=f, fill="#000000")
         y += 35
 
-    # 繪製標頭
     line_heavy()
     text_center("IKKON 薪資明細表", f=font_title)
     line_heavy()
@@ -628,7 +619,6 @@ def create_payslip_image(record, month_str, custom_msg):
     text_left(f"員工姓名：{record['員工姓名']} ({record['身份']})", f=font_bold)
     line_light()
 
-    # 基本薪資
     text_left("【基本薪資】", f=font_bold)
     if record['身份'] == "正職":
         text_row("本薪 / 基礎薪：", f"{int(record['本薪/PT基礎薪']):,}")
@@ -637,7 +627,6 @@ def create_payslip_image(record, month_str, custom_msg):
     text_row("精算時薪：", f"{int(record['精算時薪']):,}")
     y += 10
 
-    # 加項與獎金
     text_left("【加項與獎金】", f=font_bold)
     has_bonus = False
     if record['加班時數'] > 0:
@@ -661,13 +650,11 @@ def create_payslip_image(record, month_str, custom_msg):
     text_row("加項與獎金總計：", f"{int(total_adds):,}", f=font_bold)
     y += 10
 
-    # 扣項
     text_left("【扣項】", f=font_bold)
     text_row(f"出勤扣款({record['遲到早退合計(分)']}分)：", f"{int(record['出勤扣款']):,}")
     text_row("勞健保扣款：", f"{int(record['勞健保扣款']):,}")
     y += 15
 
-    # 結算
     line_heavy()
     text_row("本月實領薪資：", f"{int(record['本月實領薪資']):,}", f=font_title)
     y += 10
@@ -677,64 +664,17 @@ def create_payslip_image(record, month_str, custom_msg):
         y += 10
         text_center(custom_msg, f=font_bold)
 
-    # 根據內容長度完美裁切畫布
     img = img.crop((0, 0, 550, y + 40))
 
-    # 轉換為位元組，供 ZIP 打包
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format='JPEG', quality=95)
     return img_byte_arr.getvalue()
-
-# 文字預覽版 (保留給介面顯示)
-def create_payslip_text(record, month_str, custom_msg):
-    lines = []
-    lines.append("=======================================")
-    lines.append("           IKKON 薪資明細表")
-    lines.append("=======================================")
-    lines.append(f"發放月份：{month_str}")
-    lines.append(f"員工姓名：{record['員工姓名']} ({record['身份']})")
-    lines.append("---------------------------------------")
-    lines.append("【基本薪資】")
-    if record['身份'] == "正職":
-        lines.append(f"本薪 / 基礎薪：  {int(record['本薪/PT基礎薪']):,}")
-    else:
-        lines.append(f"出勤薪資({record['總工時']}H)：  {int(record['本薪/PT基礎薪']):,}")
-    lines.append(f"精算時薪：  {int(record['精算時薪']):,}")
-    lines.append("")
-    lines.append("【加項與獎金】")
-    has_bonus = False
-    if record['加班時數'] > 0:
-        lines.append(f"加班加給({record['加班時數']}H)：  {int(record['加班加給']):,}")
-        has_bonus = True
-    for b_name, b_val in record['動態獎金明細'].items():
-        lines.append(f"{b_name}：  {b_val:,}")
-        has_bonus = True
-    if record['租屋補助'] > 0:
-        lines.append(f"租屋補助：  {int(record['租屋補助']):,}")
-        has_bonus = True
-    if not has_bonus:
-        lines.append("無")
-    lines.append("---------------------------------------")
-    total_adds = record['各項獎金總計'] + record['加班加給'] + record['租屋補助']
-    lines.append(f"加項與獎金總計：  {int(total_adds):,}")
-    lines.append("")
-    lines.append("【扣項】")
-    lines.append(f"出勤扣款({record['遲到早退合計(分)']}分)：  {int(record['出勤扣款']):,}")
-    lines.append(f"勞健保扣款：  {int(record['勞健保扣款']):,}")
-    lines.append("=======================================")
-    lines.append(f"本月實領薪資：  {int(record['本月實領薪資']):,}")
-    lines.append("=======================================")
-    if custom_msg:
-        lines.append(custom_msg)
-    return "\n".join(lines)
 
 def create_zip_archive_images(payslips, month_str, custom_msg):
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for p in payslips:
-            # 產生高解析度 JPG 圖檔
             img_bytes = create_payslip_image(p, month_str, custom_msg)
-            # 將圖片存入壓縮檔
             zip_file.writestr(f"{p['員工姓名']}_{month_str}薪資單.jpg", img_bytes)
     return zip_buffer.getvalue()
 
@@ -743,6 +683,10 @@ def create_zip_archive_images(payslips, month_str, custom_msg):
 # ==========================================
 st.set_page_config(page_title="IKKON 薪資自動化結算系統", layout="wide")
 st.title("IKKON 薪資自動化結算系統")
+
+# 防禦性字體檢查
+if not os.path.exists("NotoSansTC-Regular.ttf"):
+    st.error("系統警告：尚未偵測到中文字體檔 (NotoSansTC-Regular.ttf)。請將該字體檔案上傳至 GitHub，否則產出的薪資圖檔將會顯示為亂碼。")
 
 st.markdown("---")
 st.markdown("### 階段一：出缺勤診斷與異常覆寫")
@@ -811,21 +755,19 @@ if ichef_file and roster_file and selected_sheet:
 st.markdown("---")
 st.markdown("### 階段二：圖形化薪資單產出")
 
-# 加入管理溫度的自訂結語欄位
 st.markdown("##### 薪資單發放設定")
-custom_msg = st.text_input("給同仁的當月結語 (將印在薪資單最下方)：", value="辛苦了，謝謝你本月的付出！")
-salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表 (包含全動態獎金)", type=["xlsx"], key="salary")
+custom_msg = st.text_input("給同仁的當月結語 (將印在圖檔最下方)：", value="辛苦了，謝謝你本月的付出！")
+salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表", type=["xlsx"], key="salary")
 
 if salary_param_file and not st.session_state.df_final_calc.empty:
     if st.button("執行第二階段：產出 JPG 薪資單"):
-        with st.spinner('繪製高解析度薪資明細表中 (首次繪製需下載字型，請稍候)...'):
+        with st.spinner('繪製高解析度薪資明細表中...'):
             df_fixed, df_var, dyn_cols, err = parse_salary_params(salary_param_file)
             if err:
                 st.error(err)
             else:
                 payslip_records = generate_final_payslip(st.session_state.df_final_calc, df_fixed, df_var, dyn_cols)
                 
-                # 打包成包含 JPG 的 ZIP 檔
                 zip_data = create_zip_archive_images(payslip_records, selected_sheet, custom_msg)
                 
                 st.success("繪製完成！點擊下方按鈕即可下載全體員工的 JPG 圖檔。")
@@ -835,14 +777,6 @@ if salary_param_file and not st.session_state.df_final_calc.empty:
                     file_name=f"IKKON_薪資圖檔_{selected_sheet}.zip",
                     mime="application/zip"
                 )
-                
-                st.markdown("#### 薪資單內容預覽區")
-                cols = st.columns(3)
-                for idx, record in enumerate(payslip_records):
-                    with cols[idx % 3]:
-                        # 介面上依然提供純文字預覽，方便你快速掃視數字是否正確
-                        slip_text = create_payslip_text(record, selected_sheet, custom_msg)
-                        st.code(slip_text, language='text')
 
 elif salary_param_file and st.session_state.df_final_calc.empty:
     st.warning("請先完成「第一階段：出缺勤試算」，再執行薪資發放。")
