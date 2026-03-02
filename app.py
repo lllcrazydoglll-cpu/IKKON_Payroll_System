@@ -149,7 +149,7 @@ def parse_roster_data(file, target_sheet):
     return pd.DataFrame(roster_list), ""
 
 # ==========================================
-# 模組三：異常表解析引擎
+# 模組三：表頭智慧追蹤異常表解析引擎
 # ==========================================
 def parse_standard_anomaly_data(file, sheet_name=None):
     if file is None:
@@ -165,21 +165,40 @@ def parse_standard_anomaly_data(file, sheet_name=None):
                 df = pd.read_excel(file, header=None)
             
         anomalies = []
+        c_date, c_name, c_cmd, c_time, c_range, c_hrs, c_rsn = 0, 1, 2, 3, -1, 4, 5
+        
         for index, row in df.iterrows():
-            date_val = str(row.iloc[0]).strip()
-            if "202" in date_val and len(row) >= 6:
+            row_vals = [str(x).strip() for x in row.values]
+            
+            if any("姓名" in v for v in row_vals) and any("指令" in v for v in row_vals):
+                for i, v in enumerate(row_vals):
+                    if "日期" in v: c_date = i
+                    elif "姓名" in v: c_name = i
+                    elif "指令" in v: c_cmd = i
+                    elif "精確" in v: c_time = i
+                    elif v == "時數異動" or "異動脈絡" in v: c_range = i
+                    elif "數值" in v or "小時" in v: c_hrs = i
+                    elif "事由" in v or "備註" in v: c_rsn = i
+                continue
+                
+            date_val = str(row_vals[c_date]) if c_date < len(row_vals) else ""
+            
+            if "202" in date_val:
                 try:
                     dt = pd.to_datetime(date_val)
                     date_str = dt.strftime('%Y-%m-%d')
                 except:
                     continue
                     
-                name = str(row.iloc[1]).strip()
-                command = str(row.iloc[2]).strip()
-                exact_time = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
-                time_range = str(row.iloc[4]).strip() if pd.notna(row.iloc[4]) else ""
-                hours_val = str(row.iloc[5]).strip() if pd.notna(row.iloc[5]) else ""
-                reason = str(row.iloc[6]).strip() if len(row) > 6 and pd.notna(row.iloc[6]) else ""
+                name = row_vals[c_name] if c_name < len(row_vals) and c_name != -1 else ""
+                command = row_vals[c_cmd] if c_cmd < len(row_vals) and c_cmd != -1 else ""
+                exact_time = row_vals[c_time] if c_time < len(row_vals) and c_time != -1 else ""
+                time_range = row_vals[c_range] if c_range < len(row_vals) and c_range != -1 else ""
+                hours_val = row_vals[c_hrs] if c_hrs < len(row_vals) and c_hrs != -1 else ""
+                reason = row_vals[c_rsn] if c_rsn < len(row_vals) and c_rsn != -1 else ""
+                
+                if exact_time in ["nan", "None", ""]: exact_time = None
+                if time_range in ["nan", "None", ""]: time_range = None
                 
                 hours_float = 0.0
                 if hours_val not in ["nan", "None", ""]:
@@ -192,10 +211,10 @@ def parse_standard_anomaly_data(file, sheet_name=None):
                     "日期": date_str,
                     "員工": name,
                     "指令": command,
-                    "精確時間": exact_time if exact_time not in ["nan", "None", ""] else None,
-                    "時數異動脈絡": time_range if time_range not in ["nan", "None", ""] else None,
+                    "精確時間": exact_time,
+                    "時數異動脈絡": time_range,
                     "時數": hours_float,
-                    "原因": reason
+                    "原因": reason if reason not in ["nan", "None"] else ""
                 })
         return pd.DataFrame(anomalies)
     except Exception as e:
@@ -314,10 +333,8 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     total_actual_hours += max(0, (out1 - in1).total_seconds() / 3600.0)
                     total_actual_hours += max(0, (out2 - in2).total_seconds() / 3600.0)
                 elif len(all_times) == 2:
-                    if all_times[0].hour < 14:
-                        in1 = max(all_times[0], s1_in)
-                    else:
-                        in1 = max(all_times[0], s2_in)
+                    if all_times[0].hour < 14: in1 = max(all_times[0], s1_in)
+                    else: in1 = max(all_times[0], s2_in)
                     out1 = all_times[1]
                     total_actual_hours += max(0, (out1 - in1).total_seconds() / 3600.0)
                 else:
@@ -328,8 +345,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     sched_in = pd.to_datetime(f"{date} {s_str[:2]}:{s_str[2:]}")
                     if len(all_times) % 2 == 0:
                         for i in range(0, len(all_times)-1, 2):
-                            in_time = all_times[i]
-                            if i == 0: in_time = max(in_time, sched_in)
+                            in_time = max(all_times[i], sched_in) if i == 0 else all_times[i]
                             out_time = all_times[i+1]
                             total_actual_hours += max(0, (out_time - in_time).total_seconds() / 3600.0)
                     else:
@@ -438,7 +454,7 @@ def parse_salary_params(file):
             if col in df_fixed.columns:
                 df_fixed[col] = pd.to_numeric(df_fixed[col], errors='coerce').fillna(0)
                 
-        # 動態掃描所有浮動獎金欄位 (排除非獎金欄位)
+        # 動態掃描所有浮動獎金欄位
         exclude_cols = ['員工姓名', '特殊節日加給(時數)']
         dynamic_bonus_cols = [c for c in df_var.columns if c not in exclude_cols]
         
@@ -475,7 +491,6 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
         exact_hourly_rate = base_salary_or_hourly / 240.0 if emp_type == "正職" and base_salary_or_hourly > 0 else base_salary_or_hourly
         display_hourly_rate = custom_round(exact_hourly_rate)
         
-        # 智慧型動態獎金字典 (只存入大於 0 的項目)
         earned_bonuses = {}
         total_variable_bonus = 0
         
@@ -560,7 +575,6 @@ def create_payslip_text(record, month_str):
         lines.append(f"租屋補助：      {int(record['租屋補助']):>12,}")
         has_bonus = True
 
-    # 動態展開獲取的獎金 (0元自動隱藏)
     for b_name, b_val in record['動態獎金明細'].items():
         lines.append(f"{b_name}： {b_val:>12,}")
         has_bonus = True
@@ -589,7 +603,6 @@ def create_zip_archive(payslips, month_str):
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for p in payslips:
             text_content = create_payslip_text(p, month_str)
-            # 使用 UTF-8 確保中文不會亂碼
             zip_file.writestr(f"{p['員工姓名']}_{month_str}薪資單.txt", text_content.encode('utf-8'))
     return zip_buffer.getvalue()
 
@@ -616,7 +629,7 @@ with col2:
         except Exception as e:
             st.error("讀取班表失敗。")
 with col3:
-    anomaly_file = st.file_uploader("3. 上傳 7欄位新版異常表 (若無可略過)", type=["csv", "xlsx"], key="anomaly")
+    anomaly_file = st.file_uploader("3. 上傳 異常表 (若無可略過)", type=["csv", "xlsx"], key="anomaly")
     anomaly_selected_sheet = None
     if anomaly_file and anomaly_file.name.endswith('.xlsx'):
         try:
@@ -647,9 +660,21 @@ if ichef_file and roster_file and selected_sheet:
                 tab_main, tab_audit, tab_error = st.tabs([
                     "每日出缺勤明細 (試算結果)", "異常表覆寫稽核", "原始打卡異常攔截 (需人工查核)"
                 ])
-                with tab_main: st.dataframe(df_final_calc)
-                with tab_audit: st.dataframe(df_audit) if not df_audit.empty else st.info("本次無覆寫紀錄。")
-                with tab_error: st.dataframe(df_error) if not df_error.empty else st.write("無異常紀錄。")
+                
+                with tab_main: 
+                    st.dataframe(df_final_calc)
+                    
+                with tab_audit: 
+                    if not df_audit.empty:
+                        st.dataframe(df_audit)
+                    else:
+                        st.info("本次無覆寫紀錄。")
+                        
+                with tab_error: 
+                    if not df_error.empty:
+                        st.dataframe(df_error)
+                    else:
+                        st.write("無異常紀錄。")
 
 st.markdown("---")
 st.markdown("### 階段二：最終薪資發放與個人薪資單產出")
