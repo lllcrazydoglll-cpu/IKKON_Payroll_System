@@ -140,7 +140,7 @@ def parse_roster_data(file, target_sheet):
     return pd.DataFrame(roster_list), ""
 
 # ==========================================
-# 模組三：異常表解析與工時碰撞引擎
+# 模組三：異常表解析引擎 (含自我糾錯機制)
 # ==========================================
 def parse_standard_anomaly_data(file):
     if file is None:
@@ -164,20 +164,50 @@ def parse_standard_anomaly_data(file):
                     
                 name = str(row.iloc[1]).strip()
                 command = str(row.iloc[2]).strip()
-                time_val = str(row.iloc[3]).strip()
-                hours_val = str(row.iloc[4]).strip()
-                reason = str(row.iloc[5]).strip() if len(row) > 5 else ""
+                time_val = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
+                hours_val = str(row.iloc[4]).strip() if pd.notna(row.iloc[4]) else ""
+                reason = str(row.iloc[5]).strip() if len(row) > 5 and pd.notna(row.iloc[5]) else ""
                 
-                try:
-                    hours_float = float(hours_val)
-                except:
-                    hours_float = 0.0
-                    
+                hours_float = 0.0
+                time_ctx = ""
+                
+                # 智慧型解析：防止使用者將時間區段填入時數欄位
+                if hours_val not in ["nan", "None", ""]:
+                    try:
+                        hours_float = float(hours_val)
+                        time_ctx = time_val
+                    except ValueError:
+                        if "-" in hours_val or "~" in hours_val or ":" in hours_val:
+                            def calc_h(t_str):
+                                try:
+                                    t_str = t_str.replace("~", "-")
+                                    start_s, end_s = t_str.split('-')
+                                    t1 = pd.to_datetime(start_s.strip())
+                                    t2 = pd.to_datetime(end_s.strip())
+                                    if t2 < t1: t2 += timedelta(days=1)
+                                    return (t2 - t1).total_seconds() / 3600.0
+                                except: return None
+                            res = calc_h(hours_val)
+                            if res is not None:
+                                hours_float = res
+                                time_ctx = hours_val
+                            else:
+                                time_ctx = hours_val
+                        else:
+                            time_ctx = hours_val
+                            
+                if time_val not in ["nan", "None", ""] and hours_float == 0.0:
+                    try:
+                        hours_float = float(time_val)
+                        time_ctx = hours_val
+                    except:
+                        if not time_ctx: time_ctx = time_val
+                        
                 anomalies.append({
                     "日期": date_str,
                     "員工": name,
                     "指令": command,
-                    "時間": time_val if time_val not in ["nan", "None", ""] else None,
+                    "時間": time_ctx if time_ctx not in ["nan", "None", ""] else None,
                     "時數": hours_float,
                     "原因": reason
                 })
@@ -185,6 +215,9 @@ def parse_standard_anomaly_data(file):
     except Exception as e:
         return pd.DataFrame()
 
+# ==========================================
+# 核心引擎：工時碰撞、PT裁切與動態覆寫結算
+# ==========================================
 def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     results = []
     audit_logs = []
@@ -240,7 +273,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     if anom['時數'] != 0.0:
                         manual_add_ot += anom['時數']
                         has_override = True
-                        # 將時間區段寫入稽核紀錄，方便人類核對
                         if time_ctx and time_ctx.lower() not in ["nan", "none", ""]:
                             override_reasons.append(f"時數增減 {anom['時數']}H [{time_ctx}]: {reason}")
                         else:
@@ -272,16 +304,60 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
 
         if not is_working and all_times:
             total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
-            support_ot = ((total_actual_hours * 60.0) // 30) * 0.5 if emp_type == "PT" else (total_actual_hours // 0.5) * 0.5
+            if emp_type == "PT":
+                pt_mins = round(total_actual_hours * 60.0, 2)
+                support_ot = (pt_mins // 30) * 0.5
+            else:
+                support_ot = (total_actual_hours // 0.5) * 0.5
             support_ot += manual_add_ot
             results.append({"日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, "遲到(分)": 0, "早退(分)": 0, "加班(時)": support_ot, "總工時(時)": round(total_actual_hours, 2), "狀態": "休假支援(全額加班)"})
             if has_override: audit_logs.append({"日期": date, "員工": emp, "原始判定": "休假支援", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)})
             continue
 
+        # PT 全新邊界裁切計算邏輯
         if emp_type == "PT":
-            total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
-            pt_hours = ((total_actual_hours * 60.0) // 30) * 0.5
+            total_actual_hours = 0
+            if shift_str == "1100-2200":
+                s1_in = pd.to_datetime(f"{date} 11:00:00")
+                s2_in = pd.to_datetime(f"{date} 17:00:00")
+                if len(all_times) >= 4:
+                    in1 = max(all_times[0], s1_in)
+                    out1 = all_times[1]
+                    in2 = max(all_times[2], s2_in)
+                    out2 = all_times[3]
+                    total_actual_hours += max(0, (out1 - in1).total_seconds() / 3600.0)
+                    total_actual_hours += max(0, (out2 - in2).total_seconds() / 3600.0)
+                elif len(all_times) == 2:
+                    if all_times[0].hour < 14:
+                        in1 = max(all_times[0], s1_in)
+                    else:
+                        in1 = max(all_times[0], s2_in)
+                    out1 = all_times[1]
+                    total_actual_hours += max(0, (out1 - in1).total_seconds() / 3600.0)
+                else:
+                    total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
+            elif shift_str != "正常班" and "-" in shift_str:
+                try:
+                    s_str = shift_str.split('-')[0]
+                    sched_in = pd.to_datetime(f"{date} {s_str[:2]}:{s_str[2:]}")
+                    if len(all_times) % 2 == 0:
+                        for i in range(0, len(all_times)-1, 2):
+                            in_time = all_times[i]
+                            if i == 0: in_time = max(in_time, sched_in)
+                            out_time = all_times[i+1]
+                            total_actual_hours += max(0, (out_time - in_time).total_seconds() / 3600.0)
+                    else:
+                        total_actual_hours = max(0, (all_times[-1] - max(all_times[0], sched_in)).total_seconds() / 3600.0)
+                except:
+                    total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
+            else:
+                total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
+
+            # 防禦浮點數運算誤差
+            pt_mins = round(total_actual_hours * 60.0, 2)
+            pt_hours = (pt_mins // 30) * 0.5
             pt_hours += manual_add_ot
+            
             final_status = "已套用異常覆寫" if has_override else "PT時數結算"
             results.append({"日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, "遲到(分)": 0, "早退(分)": 0, "加班(時)": manual_add_ot, "總工時(時)": pt_hours, "狀態": final_status})
             if has_override: audit_logs.append({"日期": date, "員工": emp, "原始判定": "PT工時結算", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)})
