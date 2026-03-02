@@ -547,7 +547,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
     return payslip_data
 
 # ==========================================
-# 模組五：絕對防禦 JPG 薪資圖檔生成引擎
+# 模組五：絕對防禦 JPG 薪資圖檔生成引擎 (支援長結語自動換行)
 # ==========================================
 def get_text_width(draw, text, font):
     try:
@@ -559,8 +559,17 @@ def get_text_width(draw, text, font):
         except AttributeError:
             return draw.textsize(text, font=font)[0]
 
+# 智慧斷行模組：將長字串依據畫布寬度自動切分為多行
+def split_text_into_lines(text, max_chars_per_line=22):
+    lines = []
+    while len(text) > max_chars_per_line:
+        lines.append(text[:max_chars_per_line])
+        text = text[max_chars_per_line:]
+    if text:
+        lines.append(text)
+    return lines
+
 def create_payslip_image(record, month_str, custom_msg):
-    # 強制讀取本地字體檔，杜絕網路中斷導致的亂碼
     font_path = "NotoSansTC-Regular.ttf"
     
     try:
@@ -568,14 +577,24 @@ def create_payslip_image(record, month_str, custom_msg):
         font_title = ImageFont.truetype(font_path, 26)
         font_bold = ImageFont.truetype(font_path, 22)
     except OSError:
-        # 如果你忘記上傳檔案，系統會發出警告，而不是崩潰
         font = ImageFont.load_default()
         font_title = font
         font_bold = font
 
+    # 結語斷行預處理與高度探測
+    msg_lines = []
+    if custom_msg:
+        # 如果使用者自己有按 Enter 換行，先拆開
+        raw_lines = custom_msg.split('\n')
+        for raw_l in raw_lines:
+            # 針對每一段再做字數長度裁切
+            msg_lines.extend(split_text_into_lines(raw_l, 24))
+
+    # 動態計算畫布高度 (基本高度 + 獎金數量擴充 + 長結語擴充)
     base_h = 700
     bonus_count = len(record['動態獎金明細'])
-    img_h = base_h + (bonus_count * 35)
+    msg_count = len(msg_lines)
+    img_h = base_h + (bonus_count * 35) + (msg_count * 35)
 
     img = Image.new('RGB', (550, img_h), color='#FFFFFF')
     draw = ImageDraw.Draw(img)
@@ -660,11 +679,14 @@ def create_payslip_image(record, month_str, custom_msg):
     y += 10
     line_heavy()
 
-    if custom_msg:
+    # 印出完美斷行的結語
+    if msg_lines:
         y += 10
-        text_center(custom_msg, f=font_bold)
+        for line in msg_lines:
+            text_center(line, f=font_bold)
 
-    img = img.crop((0, 0, 550, y + 40))
+    # 根據最終 Y 座標完美裁切畫布底部
+    img = img.crop((0, 0, 550, y + 20))
 
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format='JPEG', quality=95)
@@ -684,7 +706,6 @@ def create_zip_archive_images(payslips, month_str, custom_msg):
 st.set_page_config(page_title="IKKON 薪資自動化結算系統", layout="wide")
 st.title("IKKON 薪資自動化結算系統")
 
-# 防禦性字體檢查
 if not os.path.exists("NotoSansTC-Regular.ttf"):
     st.error("系統警告：尚未偵測到中文字體檔 (NotoSansTC-Regular.ttf)。請將該字體檔案上傳至 GitHub，否則產出的薪資圖檔將會顯示為亂碼。")
 
@@ -756,7 +777,7 @@ st.markdown("---")
 st.markdown("### 階段二：圖形化薪資單產出")
 
 st.markdown("##### 薪資單發放設定")
-custom_msg = st.text_input("給同仁的當月結語 (將印在圖檔最下方)：", value="辛苦了，謝謝你本月的付出！")
+custom_msg = st.text_area("給同仁的當月結語 (支援多行輸入，將印在圖檔最下方)：", value="辛苦了，謝謝你本月的付出！", height=100)
 salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表", type=["xlsx"], key="salary")
 
 if salary_param_file and not st.session_state.df_final_calc.empty:
