@@ -1,6 +1,13 @@
 import streamlit as st
 import pandas as pd
+import math
 from datetime import datetime, timedelta
+
+# ==========================================
+# 會計級精算：強制傳統四捨五入
+# ==========================================
+def custom_round(n):
+    return int(math.floor(n + 0.5))
 
 # ==========================================
 # 模組一：打卡紀錄清洗
@@ -150,7 +157,6 @@ def parse_standard_anomaly_data(file, sheet_name=None):
         if file.name.endswith('.csv'):
             df = pd.read_csv(file, header=None)
         else:
-            # 支援 Excel 動態分頁讀取
             if sheet_name:
                 df = pd.read_excel(file, sheet_name=sheet_name, header=None)
             else:
@@ -416,7 +422,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
-# 模組四：最終薪資報表產出引擎
+# 模組四：最終薪資報表產出引擎 (會計級精算)
 # ==========================================
 def parse_salary_params(file):
     try:
@@ -463,7 +469,9 @@ def generate_final_payslip(df_calc, df_fixed, df_var):
         health_ins = fixed_record['健保扣款'].values[0] if not fixed_record.empty and '健保扣款' in fixed_record.columns else 0
         rent_subsidy = fixed_record['租屋補助'].values[0] if not fixed_record.empty and '租屋補助' in fixed_record.columns else 0
         
-        hourly_rate = round(base_salary_or_hourly / 240.0) if emp_type == "正職" and base_salary_or_hourly > 0 else base_salary_or_hourly
+        # 建立高精確度時薪，作為內部運算基準，避免過早取整
+        exact_hourly_rate = base_salary_or_hourly / 240.0 if emp_type == "正職" and base_salary_or_hourly > 0 else base_salary_or_hourly
+        display_hourly_rate = custom_round(exact_hourly_rate)
         
         total_variable_bonus = 0
         special_holiday_bonus = 0
@@ -476,20 +484,21 @@ def generate_final_payslip(df_calc, df_fixed, df_var):
             if '特殊節日加給(時數)' in var_record.columns:
                 sh_hours = var_record['特殊節日加給(時數)'].values[0]
                 if sh_hours > 0:
-                    special_holiday_bonus = round(hourly_rate * sh_hours * 1.5)
+                    special_holiday_bonus = custom_round(exact_hourly_rate * sh_hours * 1.5)
                     total_variable_bonus += special_holiday_bonus
 
         if emp_type == "PT":
             base_pay = 0
             time_deduction = 0
-            work_pay = round(emp_data['總工時(時)'] * hourly_rate)
-            ot_pay = round(emp_data['加班(時)'] * hourly_rate) 
+            work_pay = custom_round(emp_data['總工時(時)'] * exact_hourly_rate)
+            ot_pay = custom_round(emp_data['加班(時)'] * exact_hourly_rate) 
             gross_pay = work_pay + ot_pay + rent_subsidy + total_variable_bonus
         else:
             base_pay = base_salary_or_hourly
             total_penalty_mins = emp_data['遲到(分)'] + emp_data['早退(分)']
-            time_deduction = round(total_penalty_mins * (hourly_rate / 60.0))
-            ot_pay = round(emp_data['加班(時)'] * hourly_rate)
+            # 扣款採用無限小數時薪，於最後一刻進行傳統四捨五入
+            time_deduction = custom_round(total_penalty_mins * (exact_hourly_rate / 60.0))
+            ot_pay = custom_round(emp_data['加班(時)'] * exact_hourly_rate)
             gross_pay = base_pay + ot_pay + rent_subsidy + total_variable_bonus - time_deduction
             
         net_pay = gross_pay - labor_ins - health_ins
@@ -497,7 +506,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var):
         record = {
             "員工姓名": emp_name,
             "身份": emp_type,
-            "精算時薪": hourly_rate,
+            "精算時薪": display_hourly_rate,
             "本薪/PT基礎薪": base_pay if emp_type == "正職" else work_pay,
             "加班時數": emp_data['加班(時)'],
             "加班加給": ot_pay,
