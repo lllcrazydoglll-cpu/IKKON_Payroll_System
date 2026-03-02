@@ -140,9 +140,9 @@ def parse_roster_data(file, target_sheet):
     return pd.DataFrame(roster_list), ""
 
 # ==========================================
-# 模組三：支援 7 欄位新版異常表解析引擎
+# 模組三：支援分頁與 7 欄位之異常表解析引擎
 # ==========================================
-def parse_standard_anomaly_data(file):
+def parse_standard_anomaly_data(file, sheet_name=None):
     if file is None:
         return pd.DataFrame()
         
@@ -150,12 +150,15 @@ def parse_standard_anomaly_data(file):
         if file.name.endswith('.csv'):
             df = pd.read_csv(file, header=None)
         else:
-            df = pd.read_excel(file, header=None)
+            # 支援 Excel 動態分頁讀取
+            if sheet_name:
+                df = pd.read_excel(file, sheet_name=sheet_name, header=None)
+            else:
+                df = pd.read_excel(file, header=None)
             
         anomalies = []
         for index, row in df.iterrows():
             date_val = str(row.iloc[0]).strip()
-            # 支援 7 個欄位的新版設計
             if "202" in date_val and len(row) >= 6:
                 try:
                     dt = pd.to_datetime(date_val)
@@ -250,7 +253,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     if anom['時數'] != 0.0:
                         manual_add_ot += anom['時數']
                         has_override = True
-                        # 結合人類可讀的時間脈絡印出
                         if time_range and time_range.lower() not in ["nan", "none", ""]:
                             override_reasons.append(f"時數增減 {anom['時數']}H [{time_range}]: {reason}")
                         else:
@@ -536,6 +538,14 @@ with col2:
             st.error("讀取班表失敗。")
 with col3:
     anomaly_file = st.file_uploader("3. 上傳 7欄位新版異常表 (若無可略過)", type=["csv", "xlsx"], key="anomaly")
+    anomaly_selected_sheet = None
+    if anomaly_file and anomaly_file.name.endswith('.xlsx'):
+        try:
+            xls_anomaly = pd.ExcelFile(anomaly_file)
+            anomaly_sheet_names = xls_anomaly.sheet_names
+            anomaly_selected_sheet = st.selectbox("請選擇異常表月份 (工作表)：", anomaly_sheet_names)
+        except Exception as e:
+            st.error("讀取異常表分頁失敗。")
 
 if 'df_final_calc' not in st.session_state:
     st.session_state.df_final_calc = pd.DataFrame()
@@ -549,7 +559,7 @@ if ichef_file and roster_file and selected_sheet:
             if error_msg:
                 st.error(error_msg)
             else:
-                df_anomaly = parse_standard_anomaly_data(anomaly_file)
+                df_anomaly = parse_standard_anomaly_data(anomaly_file, anomaly_selected_sheet)
                 df_final_calc, df_audit = calculate_payroll_hours(df_roster, df_cleaned, df_anomaly)
                 
                 st.session_state.df_final_calc = df_final_calc
