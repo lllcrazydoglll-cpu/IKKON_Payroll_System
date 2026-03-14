@@ -441,14 +441,14 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
-# 模組四：最終薪資與會計報表產出引擎 (導入動態時數乘數)
+# 模組四：最終薪資與會計報表產出引擎 (加入時數獎勵動態解析)
 # ==========================================
 def parse_salary_params(file):
     try:
         df_fixed = pd.read_excel(file, sheet_name="固定參數")
         df_var = pd.read_excel(file, sheet_name="本月浮動獎金")
         
-        # 嘗試讀取全新的「時數獎勵」分頁，若無則建立空表防呆
+        # 讀取全新的「時數獎勵」分頁，若無則建立空表防呆
         try:
             df_hr_reward = pd.read_excel(file, sheet_name="時數獎勵")
             df_hr_reward.columns = df_hr_reward.columns.str.strip()
@@ -469,20 +469,20 @@ def parse_salary_params(file):
         for col in dynamic_bonus_cols + (['特殊節日加給(時數)'] if '特殊節日加給(時數)' in df_var.columns else []):
             df_var[col] = pd.to_numeric(df_var[col], errors='coerce').fillna(0)
             
-        # 解析動態時數與倍數組合
+        # 動態掃描並配對「時數」與「倍數」欄位
         hr_reward_pairs = []
         if not df_hr_reward.empty:
             for col in df_hr_reward.columns:
-                if col.endswith('(時數)'):
+                if str(col).endswith('(時數)'):
                     base_name = col.replace('(時數)', '')
                     mult_col = f"{base_name}(倍數)"
                     
                     df_hr_reward[col] = pd.to_numeric(df_hr_reward[col], errors='coerce').fillna(0)
                     
+                    # 如果找到了時數，去隔壁找有沒有倍數設定。沒有的話自動以 1 倍計算
                     if mult_col in df_hr_reward.columns:
                         df_hr_reward[mult_col] = pd.to_numeric(df_hr_reward[mult_col], errors='coerce').fillna(1.0)
                     else:
-                        # 找不到設定倍數，強制預設為 1.0 倍防呆
                         df_hr_reward[mult_col] = 1.0
                         
                     hr_reward_pairs.append((col, mult_col, base_name))
@@ -522,7 +522,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, df_hr_
         total_variable_bonus = 0
         special_holiday_bonus = 0
         
-        # 1. 處理純金額獎金與舊版特殊節日
+        # 1. 處理純金額獎金 (與舊版相容處理)
         if not var_record.empty:
             for col in dynamic_bonus_cols:
                 val = var_record[col].values[0]
@@ -538,7 +538,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, df_hr_
                         earned_bonuses['特殊節日加成(1.5倍)'] = special_val
                         total_variable_bonus += special_val
                         special_holiday_bonus += special_val
-                        
+
         # 2. 處理全新的「時數獎勵」計算引擎
         if not hr_record.empty:
             for hr_col, mult_col, base_name in hr_reward_pairs:
@@ -547,11 +547,11 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, df_hr_
                 if h_val > 0:
                     calculated_val = custom_round(exact_hourly_rate * h_val * m_val)
                     if calculated_val > 0:
-                        # 在薪資單上呈現讓員工看懂的乘數標示 (若是 1倍 則不顯示括號)
+                        # 幫你把倍數標示上去，如果剛好是 1 倍，就不印括號保持乾淨
                         display_name = f"{base_name}({m_val}倍)" if m_val != 1.0 else base_name
                         earned_bonuses[display_name] = calculated_val
                         total_variable_bonus += calculated_val
-                        special_holiday_bonus += calculated_val # 同步寫入會計報表的獎金匯總區
+                        special_holiday_bonus += calculated_val # 同步匯入會計報表
 
         if emp_type == "PT":
             base_pay = 0
@@ -772,7 +772,7 @@ def create_zip_archive_images(payslips, month_str, custom_msg):
 # 介面渲染：兩階段防禦性解耦架構 (Session State 保護)
 # ==========================================
 st.set_page_config(page_title="IKKON 薪資自動化結算系統", layout="wide")
-st.title("IKKON 薪 कुटुंब自動化結算系統")
+st.title("IKKON 薪資自動化結算系統")
 
 if not os.path.exists("NotoSansTC-Regular.ttf"):
     st.error("系統警告：尚未偵測到中文字體檔 (NotoSansTC-Regular.ttf)。請將該檔案上傳至 GitHub，否則產出的薪資圖檔將會顯示為亂碼。")
