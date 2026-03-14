@@ -306,7 +306,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         
         if not is_working and not all_times:
             if has_override and manual_add_ot != 0:
-                results.append({"日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, "遲到(分)": 0, "早退(分)": 0, "加班(時)": manual_add_ot, "總工時(時)": 0, "狀態": "已套用異常覆寫"})
+                results.append({"日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, "遲到(分)": 0, "早退(分)": 0, "加班(時)": manual_add_ot, "總工時(時)": 0, "状态": "已套用異常覆寫"})
                 audit_logs.append({"日期": date, "員工": emp, "原始判定": "排休無打卡", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)})
             continue
             
@@ -628,7 +628,7 @@ def generate_accounting_excel(payslip_records, revenue):
     return output.getvalue()
 
 # ==========================================
-# 模組六：絕對防禦 JPG 薪資圖檔生成引擎 (完美對齊排版)
+# 模組六：絕對防禦 JPG 薪資圖檔生成引擎 (完美視覺對齊排版)
 # ==========================================
 def get_text_width(draw, text, font):
     try:
@@ -701,14 +701,14 @@ def create_payslip_image(record, month_str, custom_msg):
         draw.text((right - w, y), str(val), font=f, fill="#000000")
         y += 35
 
-    # 1. 標頭區塊 (導入絕對對稱上下留白)
+    # 1. 標頭區塊 (導入不對稱像素抵銷法，達成絕對視覺置中)
     draw.line([(margin, y), (right, y)], fill="#000000", width=3)
-    y += 16 # 頂部精準留白
+    y += 8 # 頂部精準壓縮，抵銷字體內建空白
     w = get_text_width(draw, "IKKON 薪資明細表", font_title)
     draw.text(((550 - w) / 2, y), "IKKON 薪資明細表", font=font_title, fill="#000000")
-    y += 42 # 字體高度 + 底部精準留白
+    y += 44 # 底部精準擴張，將底線穩妥下壓
     draw.line([(margin, y), (right, y)], fill="#000000", width=3)
-    y += 25 # 推移至下個段落
+    y += 25 
 
     text_left(f"發放月份：{month_str}", f=font_bold)
     text_left(f"員工姓名：{record['員工姓名']} ({record['身份']})", f=font_bold)
@@ -753,16 +753,16 @@ def create_payslip_image(record, month_str, custom_msg):
     text_row("勞健保扣款：", fmt(record['勞健保扣款']))
     y += 15
 
-    # 5. 實領薪資區塊 (導入絕對對稱上下留白)
+    # 5. 實領薪資區塊 (導入不對稱像素抵銷法)
     draw.line([(margin, y), (right, y)], fill="#000000", width=3)
-    y += 16 # 頂部精準留白
+    y += 8 # 頂部精準壓縮
     draw.text((margin, y), "本月實領薪資：", font=font_title, fill="#000000")
     val_str = f"{record['本月實領薪資']:,}"
     w = get_text_width(draw, val_str, font_title)
     draw.text((right - w, y), val_str, font=font_title, fill="#000000")
-    y += 42 # 字體高度 + 底部精準留白
+    y += 44 # 底部精準擴張
     draw.line([(margin, y), (right, y)], fill="#000000", width=3)
-    y += 20 # 推移至結語段落
+    y += 20 
 
     if msg_lines:
         y += 10
@@ -891,7 +891,7 @@ if salary_param_file and not st.session_state.df_final_calc.empty:
         dl_col1, dl_col2 = st.columns(2)
         with dl_col1:
             st.download_button(
-                label="📥 下載全體員工 JPG 薪薪資圖檔 (ZIP)",
+                label="📥 下載全體員工 JPG 薪資圖檔 (ZIP)",
                 data=st.session_state.zip_data,
                 file_name=f"IKKON_薪資圖檔_{selected_sheet}.zip",
                 mime="application/zip"
