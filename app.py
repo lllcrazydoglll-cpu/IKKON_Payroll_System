@@ -8,10 +8,24 @@ from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timedelta
 
 # ==========================================
-# 會計級精算：強制傳統四捨五入
+# 會計級精算引擎
 # ==========================================
 def custom_round(n):
+    """最終薪資：四捨五入至整數"""
     return int(math.floor(n + 0.5))
+
+def custom_round_2(n):
+    """過程項目：嚴格保留兩位小數"""
+    return math.floor(n * 100 + 0.5) / 100.0
+
+def fmt(val):
+    """報表排版：自動隱藏無意義的小數點 (例: 1750.00 -> 1750, 1750.50 -> 1750.5)"""
+    s = f"{val:,.2f}"
+    if s.endswith(".00"):
+        return s[:-3]
+    if s.endswith("0"):
+        return s[:-1]
+    return s
 
 # ==========================================
 # 模組一：打卡紀錄清洗
@@ -441,14 +455,13 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
-# 模組四：最終薪資與會計報表產出引擎 (加入時數獎勵動態解析)
+# 模組四：最終薪資與會計報表產出引擎 (小數點精密計算)
 # ==========================================
 def parse_salary_params(file):
     try:
         df_fixed = pd.read_excel(file, sheet_name="固定參數")
         df_var = pd.read_excel(file, sheet_name="本月浮動獎金")
         
-        # 讀取全新的「時數獎勵」分頁，若無則建立空表防呆
         try:
             df_hr_reward = pd.read_excel(file, sheet_name="時數獎勵")
             df_hr_reward.columns = df_hr_reward.columns.str.strip()
@@ -469,7 +482,6 @@ def parse_salary_params(file):
         for col in dynamic_bonus_cols + (['特殊節日加給(時數)'] if '特殊節日加給(時數)' in df_var.columns else []):
             df_var[col] = pd.to_numeric(df_var[col], errors='coerce').fillna(0)
             
-        # 動態掃描並配對「時數」與「倍數」欄位
         hr_reward_pairs = []
         if not df_hr_reward.empty:
             for col in df_hr_reward.columns:
@@ -479,7 +491,6 @@ def parse_salary_params(file):
                     
                     df_hr_reward[col] = pd.to_numeric(df_hr_reward[col], errors='coerce').fillna(0)
                     
-                    # 如果找到了時數，去隔壁找有沒有倍數設定。沒有的話自動以 1 倍計算
                     if mult_col in df_hr_reward.columns:
                         df_hr_reward[mult_col] = pd.to_numeric(df_hr_reward[mult_col], errors='coerce').fillna(1.0)
                     else:
@@ -489,7 +500,7 @@ def parse_salary_params(file):
                 
         return df_fixed, df_var, dynamic_bonus_cols, df_hr_reward, hr_reward_pairs, ""
     except Exception as e:
-        return None, None, None, None, None, "薪資與獎金設定表讀取失敗，請確認檔案結構包含「固定參數」與「本月浮動獎金」（建議新增「時數獎勵」分頁）。"
+        return None, None, None, None, None, "薪資與獎金設定表讀取失敗，請確認檔案結構包含「固定參數」與「本月浮動獎金」。"
 
 def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, df_hr_reward, hr_reward_pairs):
     summary = df_calc.groupby('員工').agg({
@@ -515,63 +526,60 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, df_hr_
         health_ins = fixed_record['健保扣款'].values[0] if not fixed_record.empty and '健保扣款' in fixed_record.columns else 0
         rent_subsidy = fixed_record['租屋補助'].values[0] if not fixed_record.empty and '租屋補助' in fixed_record.columns else 0
         
-        exact_hourly_rate = base_salary_or_hourly / 240.0 if emp_type == "正職" and base_salary_or_hourly > 0 else base_salary_or_hourly
-        display_hourly_rate = custom_round(exact_hourly_rate)
+        # 轉換為高精度浮點數
+        exact_hourly_rate = float(base_salary_or_hourly / 240.0) if emp_type == "正職" and base_salary_or_hourly > 0 else float(base_salary_or_hourly)
         
         earned_bonuses = {}
-        total_variable_bonus = 0
-        special_holiday_bonus = 0
+        total_variable_bonus = 0.0
+        special_holiday_bonus = 0.0
         
-        # 1. 處理純金額獎金 (與舊版相容處理)
         if not var_record.empty:
             for col in dynamic_bonus_cols:
-                val = var_record[col].values[0]
+                val = float(var_record[col].values[0])
                 if val > 0:
-                    earned_bonuses[col] = int(val)
+                    earned_bonuses[col] = val
                     total_variable_bonus += val
                     
             if '特殊節日加給(時數)' in var_record.columns:
-                sh_hours = var_record['特殊節日加給(時數)'].values[0]
+                sh_hours = float(var_record['特殊節日加給(時數)'].values[0])
                 if sh_hours > 0:
-                    special_val = custom_round(exact_hourly_rate * sh_hours * 1.5)
+                    special_val = custom_round_2(exact_hourly_rate * sh_hours * 1.5)
                     if special_val > 0:
                         earned_bonuses['特殊節日加成(1.5倍)'] = special_val
                         total_variable_bonus += special_val
                         special_holiday_bonus += special_val
 
-        # 2. 處理全新的「時數獎勵」計算引擎
         if not hr_record.empty:
             for hr_col, mult_col, base_name in hr_reward_pairs:
-                h_val = hr_record[hr_col].values[0]
-                m_val = hr_record[mult_col].values[0]
+                h_val = float(hr_record[hr_col].values[0])
+                m_val = float(hr_record[mult_col].values[0])
                 if h_val > 0:
-                    calculated_val = custom_round(exact_hourly_rate * h_val * m_val)
+                    calculated_val = custom_round_2(exact_hourly_rate * h_val * m_val)
                     if calculated_val > 0:
-                        # 幫你把倍數標示上去，如果剛好是 1 倍，就不印括號保持乾淨
                         display_name = f"{base_name}({m_val}倍)" if m_val != 1.0 else base_name
                         earned_bonuses[display_name] = calculated_val
                         total_variable_bonus += calculated_val
-                        special_holiday_bonus += calculated_val # 同步匯入會計報表
+                        special_holiday_bonus += calculated_val
 
         if emp_type == "PT":
-            base_pay = 0
-            time_deduction = 0
-            work_pay = custom_round(emp_data['總工時(時)'] * exact_hourly_rate)
-            ot_pay = custom_round(emp_data['加班(時)'] * exact_hourly_rate) 
-            gross_pay = work_pay + ot_pay + rent_subsidy + total_variable_bonus
+            base_pay = 0.0
+            time_deduction = 0.0
+            work_pay = custom_round_2(emp_data['總工時(時)'] * exact_hourly_rate)
+            ot_pay = custom_round_2(emp_data['加班(時)'] * exact_hourly_rate) 
+            gross_pay = work_pay + ot_pay + float(rent_subsidy) + total_variable_bonus
         else:
-            base_pay = base_salary_or_hourly
+            base_pay = float(base_salary_or_hourly)
             total_penalty_mins = emp_data['遲到(分)'] + emp_data['早退(分)']
-            time_deduction = custom_round(total_penalty_mins * (exact_hourly_rate / 60.0))
-            ot_pay = custom_round(emp_data['加班(時)'] * exact_hourly_rate)
-            gross_pay = base_pay + ot_pay + rent_subsidy + total_variable_bonus - time_deduction
+            time_deduction = custom_round_2(total_penalty_mins * (exact_hourly_rate / 60.0))
+            ot_pay = custom_round_2(emp_data['加班(時)'] * exact_hourly_rate)
+            gross_pay = base_pay + ot_pay + float(rent_subsidy) + total_variable_bonus - time_deduction
             
-        net_pay = gross_pay - labor_ins - health_ins
+        net_pay = gross_pay - float(labor_ins) - float(health_ins)
         
         record = {
             "員工姓名": emp_name,
             "身份": emp_type,
-            "精算時薪": display_hourly_rate,
+            "精算時薪": custom_round_2(exact_hourly_rate),
             "本薪/PT基礎薪": base_pay if emp_type == "正職" else work_pay,
             "總工時": emp_data['總工時(時)'],
             "加班時數": emp_data['加班(時)'],
@@ -579,12 +587,12 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, df_hr_
             "動態獎金明細": earned_bonuses,
             "特殊節日加成金額": special_holiday_bonus,
             "遲到早退合計(分)": emp_data['遲到(分)'] + emp_data['早退(分)'],
-            "出勤扣款": -time_deduction if time_deduction > 0 else 0,
+            "出勤扣款": time_deduction,
             "各項獎金總計": total_variable_bonus,
-            "租屋補助": rent_subsidy,
+            "租屋補助": float(rent_subsidy),
             "應發薪資(毛額)": gross_pay,
-            "勞健保扣款": -(labor_ins + health_ins) if (labor_ins + health_ins) > 0 else 0,
-            "本月實領薪資": net_pay
+            "勞健保扣款": -(float(labor_ins) + float(health_ins)) if (labor_ins + health_ins) > 0 else 0.0,
+            "本月實領薪資": custom_round(net_pay) # 只有最後一刻才進行整數四捨五入
         }
         payslip_data.append(record)
         
@@ -606,7 +614,7 @@ def generate_accounting_excel(payslip_records, revenue):
     
     summary_data = {
         "統計項目": ["本月營業總額", "總人事成本 (正職+兼職)", "人事成本佔比", "正職薪資合計 (含獎金加班)", "兼職(PT)薪資合計 (含獎金)", "全體加班費合計", "全體各項獎金合計"],
-        "金額 / 數據": [f"{int(revenue):,}", f"{int(total_cost):,}", cost_ratio, f"{int(ft_total):,}", f"{int(pt_total):,}", f"{int(ot_total):,}", f"{int(bonus_total):,}"]
+        "金額 / 數據": [f"{int(revenue):,}", fmt(total_cost), cost_ratio, fmt(ft_total), fmt(pt_total), fmt(ot_total), fmt(bonus_total)]
     }
     df_summary = pd.DataFrame(summary_data)
     
@@ -709,26 +717,27 @@ def create_payslip_image(record, month_str, custom_msg):
     text_left(f"員工姓名：{record['員工姓名']} ({record['身份']})", f=font_bold)
     line_light()
 
+    # == 繪製小數點排版 ==
     text_left("【基本薪資】", f=font_bold)
     if record['身份'] == "正職":
-        text_row("本薪 / 基礎薪：", f"{int(record['本薪/PT基礎薪']):,}")
+        text_row("本薪 / 基礎薪：", fmt(record['本薪/PT基礎薪']))
     else:
-        text_row(f"出勤薪資({record['總工時']}H)：", f"{int(record['本薪/PT基礎薪']):,}")
-    text_row("精算時薪：", f"{int(record['精算時薪']):,}")
+        text_row(f"出勤薪資({record['總工時']}H)：", fmt(record['本薪/PT基礎薪']))
+    text_row("精算時薪：", fmt(record['精算時薪']))
     y += 10
 
     text_left("【加項與獎金】", f=font_bold)
     has_bonus = False
     if record['加班時數'] > 0:
-        text_row(f"加班加給({record['加班時數']}H)：", f"{int(record['加班加給']):,}")
+        text_row(f"加班加給({record['加班時數']}H)：", fmt(record['加班加給']))
         has_bonus = True
 
     for b_name, b_val in record['動態獎金明細'].items():
-        text_row(f"{b_name}：", f"{b_val:,}")
+        text_row(f"{b_name}：", fmt(b_val))
         has_bonus = True
 
     if record['租屋補助'] > 0:
-        text_row("租屋補助：", f"{int(record['租屋補助']):,}")
+        text_row("租屋補助：", fmt(record['租屋補助']))
         has_bonus = True
 
     if not has_bonus:
@@ -737,16 +746,17 @@ def create_payslip_image(record, month_str, custom_msg):
     y += 5
     line_light()
     total_adds = record['各項獎金總計'] + record['加班加給'] + record['租屋補助']
-    text_row("加項與獎金總計：", f"{int(total_adds):,}", f=font_bold)
+    text_row("加項與獎金總計：", fmt(total_adds), f=font_bold)
     y += 10
 
     text_left("【扣項】", f=font_bold)
-    text_row(f"出勤扣款({record['遲到早退合計(分)']}分)：", f"{int(record['出勤扣款']):,}")
-    text_row("勞健保扣款：", f"{int(record['勞健保扣款']):,}")
+    text_row(f"出勤扣款({record['遲到早退合計(分)']}分)：", fmt(record['出勤扣款']))
+    text_row("勞健保扣款：", fmt(record['勞健保扣款']))
     y += 15
 
     line_heavy()
-    text_row("本月實領薪資：", f"{int(record['本月實領薪資']):,}", f=font_title)
+    # 本月實領薪資是已經 custom_round 過的整數
+    text_row("本月實領薪資：", f"{record['本月實領薪資']:,}", f=font_title)
     y += 10
     line_heavy()
 
