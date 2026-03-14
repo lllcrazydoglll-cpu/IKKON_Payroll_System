@@ -11,15 +11,12 @@ from datetime import datetime, timedelta
 # 會計級精算引擎
 # ==========================================
 def custom_round(n):
-    """最終薪資：四捨五入至整數"""
     return int(math.floor(n + 0.5))
 
 def custom_round_2(n):
-    """過程項目：嚴格保留兩位小數"""
     return math.floor(n * 100 + 0.5) / 100.0
 
 def fmt(val):
-    """報表排版：自動隱藏無意義的小數點 (例: 1750.00 -> 1750, 1750.50 -> 1750.5)"""
     s = f"{val:,.2f}"
     if s.endswith(".00"):
         return s[:-3]
@@ -455,7 +452,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
-# 模組四：最終薪資與會計報表產出引擎 (小數點精密計算)
+# 模組四：最終薪資與會計報表產出引擎
 # ==========================================
 def parse_salary_params(file):
     try:
@@ -526,7 +523,6 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, df_hr_
         health_ins = fixed_record['健保扣款'].values[0] if not fixed_record.empty and '健保扣款' in fixed_record.columns else 0
         rent_subsidy = fixed_record['租屋補助'].values[0] if not fixed_record.empty and '租屋補助' in fixed_record.columns else 0
         
-        # 轉換為高精度浮點數
         exact_hourly_rate = float(base_salary_or_hourly / 240.0) if emp_type == "正職" and base_salary_or_hourly > 0 else float(base_salary_or_hourly)
         
         earned_bonuses = {}
@@ -592,7 +588,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, df_hr_
             "租屋補助": float(rent_subsidy),
             "應發薪資(毛額)": gross_pay,
             "勞健保扣款": -(float(labor_ins) + float(health_ins)) if (labor_ins + health_ins) > 0 else 0.0,
-            "本月實領薪資": custom_round(net_pay) # 只有最後一刻才進行整數四捨五入
+            "本月實領薪資": custom_round(net_pay)
         }
         payslip_data.append(record)
         
@@ -632,7 +628,7 @@ def generate_accounting_excel(payslip_records, revenue):
     return output.getvalue()
 
 # ==========================================
-# 模組六：絕對防禦 JPG 薪資圖檔生成引擎 (支援長結語)
+# 模組六：絕對防禦 JPG 薪資圖檔生成引擎 (完美對齊排版)
 # ==========================================
 def get_text_width(draw, text, font):
     try:
@@ -682,11 +678,6 @@ def create_payslip_image(record, month_str, custom_msg):
     margin = 40
     right = 510
 
-    def line_heavy():
-        nonlocal y
-        draw.line([(margin, y), (right, y)], fill="#000000", width=3)
-        y += 20
-
     def line_light():
         nonlocal y
         draw.line([(margin, y), (right, y)], fill="#CCCCCC", width=1)
@@ -710,14 +701,20 @@ def create_payslip_image(record, month_str, custom_msg):
         draw.text((right - w, y), str(val), font=f, fill="#000000")
         y += 35
 
-    line_heavy()
-    text_center("IKKON 薪資明細表", f=font_title)
-    line_heavy()
+    # 1. 標頭區塊 (導入絕對對稱上下留白)
+    draw.line([(margin, y), (right, y)], fill="#000000", width=3)
+    y += 16 # 頂部精準留白
+    w = get_text_width(draw, "IKKON 薪資明細表", font_title)
+    draw.text(((550 - w) / 2, y), "IKKON 薪資明細表", font=font_title, fill="#000000")
+    y += 42 # 字體高度 + 底部精準留白
+    draw.line([(margin, y), (right, y)], fill="#000000", width=3)
+    y += 25 # 推移至下個段落
+
     text_left(f"發放月份：{month_str}", f=font_bold)
     text_left(f"員工姓名：{record['員工姓名']} ({record['身份']})", f=font_bold)
     line_light()
 
-    # == 繪製小數點排版 ==
+    # 2. 基本薪資
     text_left("【基本薪資】", f=font_bold)
     if record['身份'] == "正職":
         text_row("本薪 / 基礎薪：", fmt(record['本薪/PT基礎薪']))
@@ -726,6 +723,7 @@ def create_payslip_image(record, month_str, custom_msg):
     text_row("精算時薪：", fmt(record['精算時薪']))
     y += 10
 
+    # 3. 加項與獎金
     text_left("【加項與獎金】", f=font_bold)
     has_bonus = False
     if record['加班時數'] > 0:
@@ -749,16 +747,22 @@ def create_payslip_image(record, month_str, custom_msg):
     text_row("加項與獎金總計：", fmt(total_adds), f=font_bold)
     y += 10
 
+    # 4. 扣項
     text_left("【扣項】", f=font_bold)
     text_row(f"出勤扣款({record['遲到早退合計(分)']}分)：", fmt(record['出勤扣款']))
     text_row("勞健保扣款：", fmt(record['勞健保扣款']))
     y += 15
 
-    line_heavy()
-    # 本月實領薪資是已經 custom_round 過的整數
-    text_row("本月實領薪資：", f"{record['本月實領薪資']:,}", f=font_title)
-    y += 10
-    line_heavy()
+    # 5. 實領薪資區塊 (導入絕對對稱上下留白)
+    draw.line([(margin, y), (right, y)], fill="#000000", width=3)
+    y += 16 # 頂部精準留白
+    draw.text((margin, y), "本月實領薪資：", font=font_title, fill="#000000")
+    val_str = f"{record['本月實領薪資']:,}"
+    w = get_text_width(draw, val_str, font_title)
+    draw.text((right - w, y), val_str, font=font_title, fill="#000000")
+    y += 42 # 字體高度 + 底部精準留白
+    draw.line([(margin, y), (right, y)], fill="#000000", width=3)
+    y += 20 # 推移至結語段落
 
     if msg_lines:
         y += 10
@@ -887,7 +891,7 @@ if salary_param_file and not st.session_state.df_final_calc.empty:
         dl_col1, dl_col2 = st.columns(2)
         with dl_col1:
             st.download_button(
-                label="📥 下載全體員工 JPG 薪資圖檔 (ZIP)",
+                label="📥 下載全體員工 JPG 薪薪資圖檔 (ZIP)",
                 data=st.session_state.zip_data,
                 file_name=f"IKKON_薪資圖檔_{selected_sheet}.zip",
                 mime="application/zip"
