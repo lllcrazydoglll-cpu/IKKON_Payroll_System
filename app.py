@@ -24,6 +24,25 @@ def fmt(val):
         return s[:-1]
     return s
 
+def snap_punch_time(dt, is_in):
+    """
+    實體店面打卡時間防呆裁切（半小時單位）：
+    - 上班(is_in=True)：超過30分(例如32分)切到下個小時，不到30分切到30分。
+    - 下班(is_in=False)：超過30分切到30分，不到30分切到整點。
+    """
+    if is_in:
+        if dt.minute == 0 and dt.second == 0:
+            return dt
+        elif dt.minute < 30 or (dt.minute == 30 and dt.second == 0):
+            return dt.replace(minute=30, second=0, microsecond=0)
+        else:
+            return (dt + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    else:
+        if dt.minute < 30:
+            return dt.replace(minute=0, second=0, microsecond=0)
+        else:
+            return dt.replace(minute=30, second=0, microsecond=0)
+
 # ==========================================
 # 模組一：打卡紀錄清洗
 # ==========================================
@@ -37,7 +56,7 @@ def clean_ichef_data(file):
     for index, row in raw_data.iterrows():
         action = str(row[0]).strip()
         time_record = str(row[1]).strip()
-        system_keywords = ["上班", "下班", "無下班", "無上班", "無下班記錄", "無上班記錄", "無下班紀錄", "無上班紀錄", "結帳收銀", "admin", "nan", "總時數：0:00:00"]
+        system_keywords = ["上班", "下班", "無下班", "無上班", "無下班記錄", "無上班記錄", "無下班紀錄", "無上班紀錄", "結收銀", "admin", "nan", "總時數：0:00:00"]
 
         is_employee = True
         if action in system_keywords or "總時數" in action:
@@ -327,12 +346,16 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         span_hours = (actual_out - actual_in).total_seconds() / 3600.0
 
         if not is_working and all_times:
-            total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
-            if emp_type == "PT":
-                pt_mins = round(total_actual_hours * 60.0, 2)
-                support_ot = (pt_mins // 30) * 0.5
+            # 導入半小時為單位的絕對防呆裁切，修正休假支援(如16:32算17:00)的問題
+            snapped_times = [snap_punch_time(t, is_in=(i % 2 == 0)) for i, t in enumerate(all_times)]
+            
+            if len(snapped_times) % 2 == 0:
+                total_actual_hours = sum([max(0, (snapped_times[i+1] - snapped_times[i]).total_seconds() / 3600.0) for i in range(0, len(snapped_times)-1, 2)])
             else:
-                support_ot = (total_actual_hours // 0.5) * 0.5
+                total_actual_hours = max(0, (snap_punch_time(all_times[-1], False) - snap_punch_time(all_times[0], True)).total_seconds() / 3600.0)
+                
+            # 因為已經被 snap_punch_time 裁切過，算出來的時數必然是 0.5 的倍數，無須再次 // 0.5
+            support_ot = total_actual_hours
             support_ot += manual_add_ot
             results.append({"日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, "遲到(分)": 0, "早退(分)": 0, "加班(時)": support_ot, "總工時(時)": round(total_actual_hours, 2), "狀態": "休假支援(全額加班)"})
             if has_override: audit_logs.append({"日期": date, "員工": emp, "原始判定": "休假支援", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)})
@@ -531,8 +554,6 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
         hr_record = df_hr_reward[df_hr_reward['員工姓名'] == emp_name] if not df_hr_reward.empty and '員工姓名' in df_hr_reward.columns else pd.DataFrame()
         
         base_salary_or_hourly = float(fixed_record['本薪或時薪'].values[0]) if not fixed_record.empty and pd.notna(fixed_record['本薪或時薪'].values[0]) else 0.0
-        
-        # 【修正 BUG】在此處移除提早取整，讓 exact_hourly_rate 保持無限精度浮點數（例如 208.333333...），以符合財務標準。
         exact_hourly_rate = float(base_salary_or_hourly / 240.0) if emp_type == "正職" and base_salary_or_hourly > 0 else float(base_salary_or_hourly)
         
         labor_ins = float(fixed_record['勞保扣款'].values[0]) if not fixed_record.empty and '勞保扣款' in df_fixed.columns and pd.notna(fixed_record['勞保扣款'].values[0]) else 0.0
@@ -578,7 +599,6 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
                 h_val = float(hr_record[hr_col].values[0])
                 m_val = float(hr_record[mult_col].values[0])
                 if h_val > 0:
-                    # 使用無限精度時薪計算後，將個別獎金結果四捨五入到小數點後 2 位
                     calculated_val = custom_round_2(exact_hourly_rate * h_val * m_val)
                     if calculated_val > 0:
                         display_name = f"{base_name}({m_val}倍)" if m_val != 1.0 else base_name
@@ -593,7 +613,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
             ot_pay = custom_round_2(emp_data['加班(時)'] * exact_hourly_rate) 
             gross_pay = work_pay + ot_pay + total_variable_bonus
         else:
-            base_pay = base_salary_or_hourly
+            base_pay = float(base_salary_or_hourly)
             total_penalty_mins = emp_data['遲到(分)'] + emp_data['早退(分)']
             time_deduction = custom_round_2(total_penalty_mins * (exact_hourly_rate / 60.0))
             ot_pay = custom_round_2(emp_data['加班(時)'] * exact_hourly_rate)
@@ -604,7 +624,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
         record = {
             "員工姓名": emp_name,
             "身份": emp_type,
-            "精算時薪": custom_round_2(exact_hourly_rate), # 僅用於顯示排版與 Excel 留底
+            "精算時薪": custom_round_2(exact_hourly_rate),
             "本薪/PT基礎薪": base_pay if emp_type == "正職" else work_pay,
             "總工時": emp_data['總工時(時)'],
             "加班時數": emp_data['加班(時)'],
@@ -617,7 +637,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
             "各項獎金與津貼總計": total_variable_bonus,
             "各項扣款總計": total_other_deductions,
             "應發薪資(毛額)": gross_pay,
-            "勞健保扣款": -(labor_ins + health_ins) if (labor_ins + health_ins) > 0 else 0.0,
+            "勞健保扣款": -(float(labor_ins) + float(health_ins)) if (labor_ins + health_ins) > 0 else 0.0,
             "本月實領薪資": custom_round(net_pay)
         }
         payslip_data.append(record)
