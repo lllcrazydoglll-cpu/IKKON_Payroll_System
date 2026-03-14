@@ -234,7 +234,7 @@ def parse_standard_anomaly_data(file, sheet_name=None):
         return pd.DataFrame()
 
 # ==========================================
-# 核心引擎：工時碰撞
+# 核心引擎：工時碰撞 (支援異常表絕對優先權防線)
 # ==========================================
 def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     results = []
@@ -260,6 +260,9 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         override_reasons = []
         has_override = False
         
+        # 豁免自動罰則開關 (防雙重扣款核心)
+        waive_penalty = False 
+        
         if not df_anomaly.empty:
             emp_anomalies = df_anomaly[(df_anomaly['日期'] == date) & (df_anomaly['員工'] == emp)]
             for _, anom in emp_anomalies.iterrows():
@@ -272,13 +275,16 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     shift_str = "休"
                     is_working = False
                     has_override = True
+                    waive_penalty = True # 主管強制排休，豁免所有自動出缺勤計算
                     override_reasons.append(f"調休變更: {reason}")
                 elif cmd == "變更為應勤":
                     shift_str = "正常班"
                     is_working = True
                     has_override = True
+                    waive_penalty = True
                     override_reasons.append(f"調休變更: {reason}")
                 elif cmd in ["補登上班", "補登下班", "上班補登", "下班補登"]:
+                    # 補登只是修補 raw data，所以不觸發 waive_penalty，讓系統用新時間重算遲到早退
                     if exact_time:
                         ts = exact_time
                         if len(ts) == 5: ts += ":00"
@@ -292,6 +298,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     if anom['時數'] != 0.0:
                         manual_add_ot += anom['時數']
                         has_override = True
+                        waive_penalty = True # 主管手動調整時數（如病假），豁免該日自動化的遲到早退計算
                         if time_range and time_range.lower() not in ["nan", "none", ""]:
                             override_reasons.append(f"時數增減 {anom['時數']}H [{time_range}]: {reason}")
                         else:
@@ -440,6 +447,11 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     total_calculated_hours = max(0, (valid_out - max(all_times[0], sched_in)).total_seconds() / 3600.0)
                 base_hours = (sched_out - sched_in).total_seconds() / 3600.0
             except: base_hours = 8.5
+
+        # 啟動絕對防禦：若主管手動調整了這天（如請假），強制註銷系統盲目計算的遲到早退
+        if waive_penalty:
+            late_mins = 0
+            early_leave_mins = 0
                 
         overflow = total_calculated_hours - base_hours
         overtime_hours = (overflow // 0.5) * 0.5 if overflow > 0 else 0
@@ -452,7 +464,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
-# 模組四：最終薪資與會計報表產出引擎 (精準錨定名單防禦版)
+# 模組四：人事資料庫主導之最終薪資引擎
 # ==========================================
 def parse_salary_params(file):
     try:
@@ -500,7 +512,6 @@ def parse_salary_params(file):
         return None, None, None, None, None, None, "薪資與獎金設定表讀取失敗，請確認檔案結構。"
 
 def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynamic_fixed_cols, df_hr_reward, hr_reward_pairs):
-    # 【核心防呆防線】：絕對只處理出現在「本次結算班表」上的人名
     if not df_calc.empty:
         summary = df_calc.groupby('員工').agg({
             '遲到(分)': 'sum',
@@ -514,7 +525,6 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
         
     payslip_data = []
     
-    # 迴圈錨定在班表名單上，杜絕跨店污染
     for _, emp_data in summary.iterrows():
         emp_name = emp_data['員工']
         emp_type = emp_data['身份']
