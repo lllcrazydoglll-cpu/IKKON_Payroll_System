@@ -441,13 +441,20 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     return pd.DataFrame(results), pd.DataFrame(audit_logs)
 
 # ==========================================
-# 模組四：最終薪資與會計報表產出引擎
+# 模組四：最終薪資與會計報表產出引擎 (導入動態時數乘數)
 # ==========================================
 def parse_salary_params(file):
     try:
         df_fixed = pd.read_excel(file, sheet_name="固定參數")
         df_var = pd.read_excel(file, sheet_name="本月浮動獎金")
         
+        # 嘗試讀取全新的「時數獎勵」分頁，若無則建立空表防呆
+        try:
+            df_hr_reward = pd.read_excel(file, sheet_name="時數獎勵")
+            df_hr_reward.columns = df_hr_reward.columns.str.strip()
+        except Exception:
+            df_hr_reward = pd.DataFrame()
+            
         df_fixed.columns = df_fixed.columns.str.strip()
         df_var.columns = df_var.columns.str.strip()
         
@@ -461,12 +468,30 @@ def parse_salary_params(file):
         
         for col in dynamic_bonus_cols + (['特殊節日加給(時數)'] if '特殊節日加給(時數)' in df_var.columns else []):
             df_var[col] = pd.to_numeric(df_var[col], errors='coerce').fillna(0)
+            
+        # 解析動態時數與倍數組合
+        hr_reward_pairs = []
+        if not df_hr_reward.empty:
+            for col in df_hr_reward.columns:
+                if col.endswith('(時數)'):
+                    base_name = col.replace('(時數)', '')
+                    mult_col = f"{base_name}(倍數)"
+                    
+                    df_hr_reward[col] = pd.to_numeric(df_hr_reward[col], errors='coerce').fillna(0)
+                    
+                    if mult_col in df_hr_reward.columns:
+                        df_hr_reward[mult_col] = pd.to_numeric(df_hr_reward[mult_col], errors='coerce').fillna(1.0)
+                    else:
+                        # 找不到設定倍數，強制預設為 1.0 倍防呆
+                        df_hr_reward[mult_col] = 1.0
+                        
+                    hr_reward_pairs.append((col, mult_col, base_name))
                 
-        return df_fixed, df_var, dynamic_bonus_cols, ""
+        return df_fixed, df_var, dynamic_bonus_cols, df_hr_reward, hr_reward_pairs, ""
     except Exception as e:
-        return None, None, None, "薪資與獎金設定表讀取失敗，請確認檔案結構。"
+        return None, None, None, None, None, "薪資與獎金設定表讀取失敗，請確認檔案結構包含「固定參數」與「本月浮動獎金」（建議新增「時數獎勵」分頁）。"
 
-def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
+def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, df_hr_reward, hr_reward_pairs):
     summary = df_calc.groupby('員工').agg({
         '遲到(分)': 'sum',
         '早退(分)': 'sum',
@@ -483,6 +508,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
         
         fixed_record = df_fixed[df_fixed['員工姓名'] == emp_name] if not df_fixed.empty and '員工姓名' in df_fixed.columns else pd.DataFrame()
         var_record = df_var[df_var['員工姓名'] == emp_name] if not df_var.empty and '員工姓名' in df_var.columns else pd.DataFrame()
+        hr_record = df_hr_reward[df_hr_reward['員工姓名'] == emp_name] if not df_hr_reward.empty and '員工姓名' in df_hr_reward.columns else pd.DataFrame()
         
         base_salary_or_hourly = fixed_record['本薪或時薪'].values[0] if not fixed_record.empty and '本薪或時薪' in fixed_record.columns else 0
         labor_ins = fixed_record['勞保扣款'].values[0] if not fixed_record.empty and '勞保扣款' in fixed_record.columns else 0
@@ -496,6 +522,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
         total_variable_bonus = 0
         special_holiday_bonus = 0
         
+        # 1. 處理純金額獎金與舊版特殊節日
         if not var_record.empty:
             for col in dynamic_bonus_cols:
                 val = var_record[col].values[0]
@@ -508,8 +535,23 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols):
                 if sh_hours > 0:
                     special_val = custom_round(exact_hourly_rate * sh_hours * 1.5)
                     if special_val > 0:
-                        earned_bonuses['特殊節日加成'] = special_val
+                        earned_bonuses['特殊節日加成(1.5倍)'] = special_val
                         total_variable_bonus += special_val
+                        special_holiday_bonus += special_val
+                        
+        # 2. 處理全新的「時數獎勵」計算引擎
+        if not hr_record.empty:
+            for hr_col, mult_col, base_name in hr_reward_pairs:
+                h_val = hr_record[hr_col].values[0]
+                m_val = hr_record[mult_col].values[0]
+                if h_val > 0:
+                    calculated_val = custom_round(exact_hourly_rate * h_val * m_val)
+                    if calculated_val > 0:
+                        # 在薪資單上呈現讓員工看懂的乘數標示 (若是 1倍 則不顯示括號)
+                        display_name = f"{base_name}({m_val}倍)" if m_val != 1.0 else base_name
+                        earned_bonuses[display_name] = calculated_val
+                        total_variable_bonus += calculated_val
+                        special_holiday_bonus += calculated_val # 同步寫入會計報表的獎金匯總區
 
         if emp_type == "PT":
             base_pay = 0
@@ -730,12 +772,11 @@ def create_zip_archive_images(payslips, month_str, custom_msg):
 # 介面渲染：兩階段防禦性解耦架構 (Session State 保護)
 # ==========================================
 st.set_page_config(page_title="IKKON 薪資自動化結算系統", layout="wide")
-st.title("IKKON 薪資自動化結算系統")
+st.title("IKKON 薪 कुटुंब自動化結算系統")
 
 if not os.path.exists("NotoSansTC-Regular.ttf"):
     st.error("系統警告：尚未偵測到中文字體檔 (NotoSansTC-Regular.ttf)。請將該檔案上傳至 GitHub，否則產出的薪資圖檔將會顯示為亂碼。")
 
-# 初始化所有的保險箱 (Session State)
 if 'df_final_calc' not in st.session_state:
     st.session_state.df_final_calc = pd.DataFrame()
 if 'stage2_done' not in st.session_state:
@@ -785,7 +826,6 @@ if ichef_file and roster_file and selected_sheet:
                 df_final_calc, df_audit = calculate_payroll_hours(df_roster, df_cleaned, df_anomaly)
                 
                 st.session_state.df_final_calc = df_final_calc
-                # 若重新執行第一階段，必須重置第二階段的保險箱
                 st.session_state.stage2_done = False
                 st.session_state.zip_data = None
                 st.session_state.excel_data = None
@@ -812,7 +852,7 @@ col_a, col_b = st.columns(2)
 with col_a:
     st.markdown("##### 1. 會計核算參數")
     revenue_input = st.number_input("請輸入本月營業總額 (供計算人事成本佔比)：", min_value=0, value=0, step=1000)
-    salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表", type=["xlsx"], key="salary")
+    salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表 (含新增時數獎勵)", type=["xlsx"], key="salary")
     
 with col_b:
     st.markdown("##### 2. 薪資單發放設定")
@@ -821,18 +861,16 @@ with col_b:
 if salary_param_file and not st.session_state.df_final_calc.empty:
     if st.button("執行第二階段：產出 JPG 薪資單與會計報表"):
         with st.spinner('結合薪資基準繪製圖檔與結算會計報表中...'):
-            df_fixed, df_var, dyn_cols, err = parse_salary_params(salary_param_file)
+            df_fixed, df_var, dyn_cols, df_hr_reward, hr_pairs, err = parse_salary_params(salary_param_file)
             if err:
                 st.error(err)
             else:
-                payslip_records = generate_final_payslip(st.session_state.df_final_calc, df_fixed, df_var, dyn_cols)
+                payslip_records = generate_final_payslip(st.session_state.df_final_calc, df_fixed, df_var, dyn_cols, df_hr_reward, hr_pairs)
                 
-                # 產出檔案並將其鎖入保險箱
                 st.session_state.zip_data = create_zip_archive_images(payslip_records, selected_sheet, custom_msg)
                 st.session_state.excel_data = generate_accounting_excel(payslip_records, revenue_input)
                 st.session_state.stage2_done = True
 
-    # 將按鈕的顯示邏輯拉出 st.button 外面，藉由保險箱狀態來控制顯示
     if st.session_state.get('stage2_done') and st.session_state.get('zip_data') and st.session_state.get('excel_data'):
         st.success("結算與繪製完成！請點擊下方按鈕下載檔案。")
         
