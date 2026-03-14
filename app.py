@@ -234,7 +234,7 @@ def parse_standard_anomaly_data(file, sheet_name=None):
         return pd.DataFrame()
 
 # ==========================================
-# 核心引擎：工時碰撞 (支援異常表絕對優先權防線)
+# 核心引擎：工時碰撞
 # ==========================================
 def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     results = []
@@ -260,7 +260,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         override_reasons = []
         has_override = False
         
-        # 豁免自動罰則開關 (防雙重扣款核心)
         waive_penalty = False 
         
         if not df_anomaly.empty:
@@ -275,7 +274,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     shift_str = "休"
                     is_working = False
                     has_override = True
-                    waive_penalty = True # 主管強制排休，豁免所有自動出缺勤計算
+                    waive_penalty = True
                     override_reasons.append(f"調休變更: {reason}")
                 elif cmd == "變更為應勤":
                     shift_str = "正常班"
@@ -284,7 +283,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     waive_penalty = True
                     override_reasons.append(f"調休變更: {reason}")
                 elif cmd in ["補登上班", "補登下班", "上班補登", "下班補登"]:
-                    # 補登只是修補 raw data，所以不觸發 waive_penalty，讓系統用新時間重算遲到早退
                     if exact_time:
                         ts = exact_time
                         if len(ts) == 5: ts += ":00"
@@ -298,7 +296,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                     if anom['時數'] != 0.0:
                         manual_add_ot += anom['時數']
                         has_override = True
-                        waive_penalty = True # 主管手動調整時數（如病假），豁免該日自動化的遲到早退計算
+                        waive_penalty = True 
                         if time_range and time_range.lower() not in ["nan", "none", ""]:
                             override_reasons.append(f"時數增減 {anom['時數']}H [{time_range}]: {reason}")
                         else:
@@ -448,7 +446,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                 base_hours = (sched_out - sched_in).total_seconds() / 3600.0
             except: base_hours = 8.5
 
-        # 啟動絕對防禦：若主管手動調整了這天（如請假），強制註銷系統盲目計算的遲到早退
         if waive_penalty:
             late_mins = 0
             early_leave_mins = 0
@@ -534,7 +531,9 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
         hr_record = df_hr_reward[df_hr_reward['員工姓名'] == emp_name] if not df_hr_reward.empty and '員工姓名' in df_hr_reward.columns else pd.DataFrame()
         
         base_salary_or_hourly = float(fixed_record['本薪或時薪'].values[0]) if not fixed_record.empty and pd.notna(fixed_record['本薪或時薪'].values[0]) else 0.0
-        exact_hourly_rate = custom_round_2(base_salary_or_hourly / 240.0) if emp_type == "正職" and base_salary_or_hourly > 0 else base_salary_or_hourly
+        
+        # 【修正 BUG】在此處移除提早取整，讓 exact_hourly_rate 保持無限精度浮點數（例如 208.333333...），以符合財務標準。
+        exact_hourly_rate = float(base_salary_or_hourly / 240.0) if emp_type == "正職" and base_salary_or_hourly > 0 else float(base_salary_or_hourly)
         
         labor_ins = float(fixed_record['勞保扣款'].values[0]) if not fixed_record.empty and '勞保扣款' in df_fixed.columns and pd.notna(fixed_record['勞保扣款'].values[0]) else 0.0
         health_ins = float(fixed_record['健保扣款'].values[0]) if not fixed_record.empty and '健保扣款' in df_fixed.columns and pd.notna(fixed_record['健保扣款'].values[0]) else 0.0
@@ -579,6 +578,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
                 h_val = float(hr_record[hr_col].values[0])
                 m_val = float(hr_record[mult_col].values[0])
                 if h_val > 0:
+                    # 使用無限精度時薪計算後，將個別獎金結果四捨五入到小數點後 2 位
                     calculated_val = custom_round_2(exact_hourly_rate * h_val * m_val)
                     if calculated_val > 0:
                         display_name = f"{base_name}({m_val}倍)" if m_val != 1.0 else base_name
@@ -604,7 +604,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
         record = {
             "員工姓名": emp_name,
             "身份": emp_type,
-            "精算時薪": exact_hourly_rate,
+            "精算時薪": custom_round_2(exact_hourly_rate), # 僅用於顯示排版與 Excel 留底
             "本薪/PT基礎薪": base_pay if emp_type == "正職" else work_pay,
             "總工時": emp_data['總工時(時)'],
             "加班時數": emp_data['加班(時)'],
