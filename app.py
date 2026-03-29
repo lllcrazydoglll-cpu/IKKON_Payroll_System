@@ -248,17 +248,15 @@ def parse_standard_anomaly_data(file, sheet_name=None):
         return pd.DataFrame()
 
 # ==========================================
-# 核心引擎：工時碰撞
+# 核心引擎：工時碰撞 (支援多重打卡免疫與物理時段分割)
 # ==========================================
 def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     results = []
     audit_logs = []
     
-    # 核心修復 1：無情抹除秒數 (向下捨入到分鐘)，根除「隱形遲到/早退」問題。
-    # 範例：15:00:59 -> 15:00:00 (不遲到)；22:30:51 -> 22:30:00 (精準 30 分鐘)
+    # 無條件抹除秒數，杜絕 15:00:59 引發的判定誤差
     df_actual['上班時間'] = pd.to_datetime(df_actual['上班時間']).dt.floor('T')
     df_actual['下班時間'] = pd.to_datetime(df_actual['下班時間']).dt.floor('T')
-    
     df_actual['temp_time'] = df_actual['上班時間'].fillna(df_actual['下班時間'])
     df_actual['日期'] = df_actual['temp_time'].dt.strftime('%Y-%m-%d')
     
@@ -276,7 +274,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         missing_punch_dts = []
         override_reasons = []
         has_override = False
-        
         waive_penalty = False 
         
         if not df_anomaly.empty:
@@ -304,7 +301,6 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                         ts = exact_time
                         if len(ts) == 5: ts += ":00"
                         try:
-                            # 補登的時間一樣要抹除秒數，維持一致性
                             dt = pd.to_datetime(f"{date} {ts}").floor('T')
                             missing_punch_dts.append(dt)
                             has_override = True
@@ -320,12 +316,21 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                         else:
                             override_reasons.append(f"時數增減 {anom['時數']}H: {reason}")
 
-        all_times = []
+        raw_times = []
         for _, punch in emp_punches.iterrows():
-            if pd.notna(punch['上班時間']): all_times.append(punch['上班時間'])
-            if pd.notna(punch['下班時間']): all_times.append(punch['下班時間'])
-        all_times.extend(missing_punch_dts)
-        all_times.sort()
+            if pd.notna(punch['上班時間']): raw_times.append(punch['上班時間'])
+            if pd.notna(punch['下班時間']): raw_times.append(punch['下班時間'])
+        raw_times.extend(missing_punch_dts)
+        raw_times.sort()
+
+        # 【第一道絕對防禦：打卡訊號淨化器】
+        # 無情抹除所有 20 分鐘內的重複打卡，還原真實的 In/Out 軌跡
+        all_times = []
+        if raw_times:
+            all_times = [raw_times[0]]
+            for t in raw_times[1:]:
+                if (t - all_times[-1]).total_seconds() / 60.0 > 20:
+                    all_times.append(t)
         
         if not is_working and not all_times:
             if has_override and manual_add_ot != 0:
@@ -341,19 +346,16 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
             continue
 
         actual_in = all_times[0]
-        actual_out = all_times[-1]
-        span_hours = (actual_out - actual_in).total_seconds() / 3600.0
+        span_hours = (all_times[-1] - actual_in).total_seconds() / 3600.0
 
         if not is_working and all_times:
             snapped_times = [snap_punch_time(t, is_in=(i % 2 == 0)) for i, t in enumerate(all_times)]
-            
             if len(snapped_times) % 2 == 0:
                 total_actual_hours = sum([max(0, (snapped_times[i+1] - snapped_times[i]).total_seconds() / 3600.0) for i in range(0, len(snapped_times)-1, 2)])
             else:
                 total_actual_hours = max(0, (snap_punch_time(all_times[-1], False) - snap_punch_time(all_times[0], True)).total_seconds() / 3600.0)
                 
-            support_ot = total_actual_hours
-            support_ot += manual_add_ot
+            support_ot = total_actual_hours + manual_add_ot
             results.append({"日期": date, "員工": emp, "身份": emp_type, "班別": shift_str, "遲到(分)": 0, "早退(分)": 0, "加班(時)": support_ot, "總工時(時)": round(total_actual_hours, 2), "狀態": "休假支援(全額加班)"})
             if has_override: audit_logs.append({"日期": date, "員工": emp, "原始判定": "休假支援", "覆寫內容": "已執行上述指令", "幹部備註原因": " | ".join(override_reasons)})
             continue
@@ -361,39 +363,33 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         if emp_type == "PT":
             total_actual_hours = 0
             if shift_str == "1100-2200":
-                s1_in = pd.to_datetime(f"{date} 11:00:00")
-                s2_in = pd.to_datetime(f"{date} 17:00:00")
-                if len(all_times) >= 4:
-                    in1 = max(all_times[0], s1_in)
-                    out1 = all_times[1]
-                    # 防禦多重打卡 BUG：精準抓取最後兩筆作為第二段班
-                    in2_act = all_times[-2] if len(all_times) % 2 == 0 else all_times[-1]
-                    in2 = max(in2_act, s2_in)
-                    out2 = all_times[-1]
+                sched1_in = pd.to_datetime(f"{date} 11:00:00")
+                sched2_in = pd.to_datetime(f"{date} 17:00:00")
+                
+                seg1 = [t for t in all_times if t.hour < 15 or (t.hour == 15 and t.minute <= 30)]
+                seg2 = [t for t in all_times if t not in seg1]
+                
+                if seg1 and len(seg1) >= 2:
+                    in1 = max(seg1[0], sched1_in)
+                    out1 = seg1[-1]
                     total_actual_hours += max(0, (out1 - in1).total_seconds() / 3600.0)
+                if seg2 and len(seg2) >= 2:
+                    in2 = max(seg2[0], sched2_in)
+                    out2 = seg2[-1]
                     total_actual_hours += max(0, (out2 - in2).total_seconds() / 3600.0)
-                elif len(all_times) == 2:
-                    if all_times[0].hour < 14: in1 = max(all_times[0], s1_in)
-                    else: in1 = max(all_times[0], s2_in)
-                    out1 = all_times[1]
-                    total_actual_hours += max(0, (out1 - in1).total_seconds() / 3600.0)
-                else:
+                if not seg1 and not seg2:
                     total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
             elif shift_str != "正常班" and "-" in shift_str:
                 try:
                     s_str = shift_str.split('-')[0]
                     sched_in = pd.to_datetime(f"{date} {s_str[:2]}:{s_str[2:]}")
-                    if len(all_times) % 2 == 0:
-                        for i in range(0, len(all_times)-1, 2):
-                            in_time = max(all_times[i], sched_in) if i == 0 else all_times[i]
-                            out_time = all_times[i+1]
-                            total_actual_hours += max(0, (out_time - in_time).total_seconds() / 3600.0)
-                    else:
-                        total_actual_hours = max(0, (all_times[-1] - max(all_times[0], sched_in)).total_seconds() / 3600.0)
+                    in_time = max(all_times[0], sched_in)
+                    out_time = all_times[-1]
+                    total_actual_hours += max(0, (out_time - in_time).total_seconds() / 3600.0)
                 except:
-                    total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
+                    total_actual_hours = (all_times[-1] - all_times[0]).total_seconds() / 3600.0 if len(all_times) >= 2 else 0
             else:
-                total_actual_hours = sum([(all_times[i+1] - all_times[i]).total_seconds() / 3600.0 for i in range(0, len(all_times)-1, 2)]) if len(all_times) % 2 == 0 else span_hours
+                total_actual_hours = (all_times[-1] - all_times[0]).total_seconds() / 3600.0 if len(all_times) >= 2 else 0
 
             pt_mins = round(total_actual_hours * 60.0, 2)
             pt_hours = (pt_mins // 30) * 0.5
@@ -409,62 +405,82 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
         total_calculated_hours = 0
         
         if shift_str == "正常班":
-            if actual_in.hour < 13 or len(all_times) >= 4:
+            if actual_in.hour < 13 or len(all_times) >= 3:
                 sched1_in, sched1_out = pd.to_datetime(f"{date} 11:00:00"), pd.to_datetime(f"{date} 14:30:00")
                 sched2_in, sched2_out = pd.to_datetime(f"{date} 17:00:00"), pd.to_datetime(f"{date} 23:00:00")
                 
-                # 早班遲到
-                if all_times[0] > sched1_in: 
-                    late_mins += int((all_times[0] - sched1_in).total_seconds() / 60)
+                # 【第二道絕對防禦：時段物理分割】
+                # 強制以 15:30 為界拆分打卡陣列。徹底免疫任何未知的多重打卡陣列錯位。
+                seg1 = [t for t in all_times if t.hour < 15 or (t.hour == 15 and t.minute <= 30)]
+                seg2 = [t for t in all_times if t not in seg1]
                 
-                # 核心修復 2：精準抓取第二段班的上班時間 (倒數第二筆)，避免誤抓中間的誤打卡
-                if len(all_times) >= 4:
-                    s2_act_in = all_times[-2] if len(all_times) % 2 == 0 else all_times[-1]
-                    if s2_act_in > sched2_in: 
-                        late_mins += int((s2_act_in - sched2_in).total_seconds() / 60)
-                
-                s1_in = max(all_times[0], sched1_in)
-                s1_out = min(all_times[1] if len(all_times) >= 2 else all_times[0], sched1_out)
-                h1 = max(0, (s1_out - s1_in).total_seconds() / 3600.0)
-                
-                if len(all_times) >= 4: 
+                h1 = 0.0
+                if seg1:
+                    s1_act_in = seg1[0]
+                    s1_act_out = seg1[-1]
+                    if s1_act_in > sched1_in: late_mins += int((s1_act_in - sched1_in).total_seconds() / 60)
+                    s1_in = max(s1_act_in, sched1_in)
+                    s1_out = min(s1_act_out, sched1_out)
+                    if s1_out > s1_in: h1 = (s1_out - s1_in).total_seconds() / 3600.0
+                    
+                h2 = 0.0
+                if seg2:
+                    s2_act_in = seg2[0]
+                    s2_act_out = seg2[-1]
+                    if s2_act_in > sched2_in: late_mins += int((s2_act_in - sched2_in).total_seconds() / 60)
                     s2_in = max(s2_act_in, sched2_in)
-                    s2_act_out = all_times[-1] # 永遠只抓最後一筆作為真正下班時間
-                elif len(all_times) == 2: 
-                    s2_in = sched2_in
-                    s2_act_out = all_times[1]
-                else: 
-                    s2_in = sched2_in
-                    s2_act_out = all_times[-1]
-                
-                if s2_act_out < sched2_out and (sched2_out - s2_act_out).total_seconds() <= 1800:
-                    s2_out = sched2_out
-                else:
-                    s2_out = min(s2_act_out, sched2_out)
-                    diff = int((sched2_out - s2_act_out).total_seconds() / 60)
-                    if diff > 30: early_leave_mins = diff
+                    
+                    if s2_act_out < sched2_out and (sched2_out - s2_act_out).total_seconds() <= 1800:
+                        s2_out = sched2_out
+                    else:
+                        s2_out = min(s2_act_out, sched2_out)
+                        diff = int((sched2_out - s2_act_out).total_seconds() / 60)
+                        if diff > 30: early_leave_mins = diff
                         
-                total_calculated_hours = h1 + max(0, (s2_out - s2_in).total_seconds() / 3600.0)
+                    if s2_out > s2_in: h2 = (s2_out - s2_in).total_seconds() / 3600.0
+                    
+                total_calculated_hours = h1 + h2
                 base_hours = 8.5
             else:
                 sched_in, sched_out = pd.to_datetime(f"{date} 15:00:00"), pd.to_datetime(f"{date} 23:00:00")
-                if all_times[0] > sched_in: late_mins += int((all_times[0] - sched_in).total_seconds() / 60)
-                if actual_out < sched_out:
-                    diff = int((sched_out - actual_out).total_seconds() / 60)
-                    if diff > 30: early_leave_mins, valid_out = diff, actual_out
-                    else: valid_out = sched_out
-                else: valid_out = min(actual_out, sched_out)
+                s_act_in = all_times[0]
+                s_act_out = all_times[-1]
                 
-                total_calculated_hours = 0
-                if len(all_times) % 2 == 0:
-                    for i in range(0, len(all_times), 2):
-                        i_in, i_out = all_times[i], all_times[i+1]
-                        if i == 0: i_in = max(i_in, sched_in)
-                        if i == len(all_times)-2: i_out = valid_out
-                        total_calculated_hours += max(0, (i_out - i_in).total_seconds() / 3600.0)
-                else:
-                    total_calculated_hours = max(0, (valid_out - max(all_times[0], sched_in)).total_seconds() / 3600.0)
+                if s_act_in > sched_in: late_mins += int((s_act_in - sched_in).total_seconds() / 60)
+                if s_act_out < sched_out:
+                    diff = int((sched_out - s_act_out).total_seconds() / 60)
+                    if diff > 30: early_leave_mins = diff
+                    valid_out = s_act_out
+                else: 
+                    valid_out = min(s_act_out, sched_out)
+                    
+                valid_in = max(s_act_in, sched_in)
+                if valid_out > valid_in:
+                    total_calculated_hours = (valid_out - valid_in).total_seconds() / 3600.0
+                base_hours = 8.0
+        else:
+            try:
+                s_str, e_str = shift_str.split('-')
+                sched_in = pd.to_datetime(f"{date} {s_str[:2]}:{s_str[2:]}")
+                sched_out = pd.to_datetime(f"{date} {e_str[:2]}:{e_str[2:]}")
+                if sched_out < sched_in: sched_out += timedelta(days=1)
+                
+                s_act_in = all_times[0]
+                s_act_out = all_times[-1]
+                if s_act_in > sched_in: late_mins += int((s_act_in - sched_in).total_seconds() / 60)
+                if s_act_out < sched_out:
+                    diff = int((sched_out - s_act_out).total_seconds() / 60)
+                    if diff > 30: early_leave_mins = diff
+                    valid_out = s_act_out
+                else: 
+                    valid_out = min(s_act_out, sched_out)
+                    
+                valid_in = max(s_act_in, sched_in)
+                if valid_out > valid_in:
+                    total_calculated_hours = (valid_out - valid_in).total_seconds() / 3600.0
                 base_hours = (sched_out - sched_in).total_seconds() / 3600.0
+            except: 
+                base_hours = 8.5
 
         if waive_penalty:
             late_mins = 0
@@ -610,7 +626,7 @@ def generate_final_payslip(df_calc, df_fixed, df_var, dynamic_bonus_cols, dynami
             ot_pay = custom_round_2(emp_data['加班(時)'] * exact_hourly_rate) 
             gross_pay = work_pay + ot_pay + total_variable_bonus
         else:
-            base_pay = base_salary_or_hourly
+            base_pay = float(base_salary_or_hourly)
             total_penalty_mins = emp_data['遲到(分)'] + emp_data['早退(分)']
             time_deduction = custom_round_2(total_penalty_mins * (exact_hourly_rate / 60.0))
             ot_pay = custom_round_2(emp_data['加班(時)'] * exact_hourly_rate)
@@ -666,7 +682,7 @@ def generate_accounting_excel(payslip_records, revenue):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df_summary.to_excel(writer, sheet_name='會計統計報表', index=False)
-        df_detailed.to_excel(writer, sheet_name='員工薪令人', index=False)
+        df_detailed.to_excel(writer, sheet_name='員工薪資明細', index=False)
         
         worksheet1 = writer.sheets['會計統計報表']
         worksheet1.set_column('A:A', 30)
@@ -675,7 +691,7 @@ def generate_accounting_excel(payslip_records, revenue):
     return output.getvalue()
 
 # ==========================================
-# 模組六：絕對防禦 JPG 薪資圖檔生成引擎
+# 模組六：絕對防禦 JPG 薪資圖檔生成引擎 (完美視覺置中)
 # ==========================================
 def get_text_width(draw, text, font):
     try:
@@ -910,7 +926,7 @@ col_a, col_b = st.columns(2)
 with col_a:
     st.markdown("##### 1. 會計核算參數")
     revenue_input = st.number_input("請輸入本月營業總額 (供計算人事成本佔比)：", min_value=0, value=0, step=1000)
-    salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表", type=["xlsx"], key="salary")
+    salary_param_file = st.file_uploader("4. 上傳 薪資與獎金設定表 (支援無限欄位擴充)", type=["xlsx"], key="salary")
     
 with col_b:
     st.markdown("##### 2. 薪資單發放設定")
