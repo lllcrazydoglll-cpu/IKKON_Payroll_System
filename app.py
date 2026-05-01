@@ -255,8 +255,8 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
     audit_logs = []
     
     # 無條件抹除秒數，杜絕 15:00:59 引發的判定誤差
-    df_actual['上班時間'] = pd.to_datetime(df_actual['上班時間']).dt.floor('T')
-    df_actual['下班時間'] = pd.to_datetime(df_actual['下班時間']).dt.floor('T')
+    df_actual['上班時間'] = pd.to_datetime(df_actual['上班時間']).dt.floor('min')
+    df_actual['下班時間'] = pd.to_datetime(df_actual['下班時間']).dt.floor('min')
     df_actual['temp_time'] = df_actual['上班時間'].fillna(df_actual['下班時間'])
     df_actual['日期'] = df_actual['temp_time'].dt.strftime('%Y-%m-%d')
     
@@ -301,7 +301,7 @@ def calculate_payroll_hours(df_roster, df_actual, df_anomaly):
                         ts = exact_time
                         if len(ts) == 5: ts += ":00"
                         try:
-                            dt = pd.to_datetime(f"{date} {ts}").floor('T')
+                            dt = pd.to_datetime(f"{date} {ts}").floor('min')
                             missing_punch_dts.append(dt)
                             has_override = True
                             override_reasons.append(f"{cmd} {ts}: {reason}")
